@@ -6,6 +6,7 @@ from .agent import Agent, Playback
 from .recorder import Recorder
 from .swarm import Swarm
 from .templates.random_agent import Random
+from .templates.stochastic_goose_agent import StochasticGooseAgent
 
 load_dotenv()
 
@@ -22,7 +23,6 @@ for rec in Recorder.list():
 
 __all__ = [
     "Swarm",
-    "Random",
     "Agent",
     "Recorder",
     "Playback",
