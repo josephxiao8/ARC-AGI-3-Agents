@@ -75,7 +75,7 @@ class Decoder(nn.Module):
         x = nn.relu(self.deconv1(x))             # 5x5x128
         x = nn.relu(self.deconv2(x))             # 13x13x64
         x = nn.relu(self.deconv3(x))             # 30x30x32
-        x = mx.sigmoid(self.deconv4(x))          # 64x64xoutput_channels
+        x = self.deconv4(x)                      # 64x64xoutput_channels, logits
         return x
 
 
@@ -104,8 +104,8 @@ class ConvVAE(nn.Module):
     
 
 def vae_loss(reconstruction, x, mu, log_var, beta=10.0):
-    # Reconstruction loss (L2 as described in paper)
-    recon_loss_per_example = mx.sum(mx.square(reconstruction - x), axis=(1, 2, 3))
+    # cross-entropy reconstruction loss
+    recon_loss_per_example = mx.sum(nn.losses.cross_entropy(reconstruction, x), axis=(1, 2))
     # KL divergence
     kl_loss_per_example = -0.5 * mx.sum(
         1 + log_var - mx.square(mu) - mx.exp(log_var), 
