@@ -101,9 +101,9 @@ class VAEVisualizer:
         decoded_np = np.asarray(decoded)[0]
 
         if mode == "sample":
-            probs = np.clip(decoded_np, 0.0, None)
-            probs_sum = np.clip(probs.sum(axis=-1, keepdims=True), 1e-8, None)
-            probs = probs / probs_sum
+            shifted = decoded_np - np.max(decoded_np, axis=-1, keepdims=True)
+            probs = np.exp(shifted)
+            probs = probs / np.clip(probs.sum(axis=-1, keepdims=True), 1e-8, None)
             flat_probs = probs.reshape(-1, probs.shape[-1])
             sampled = []
             for row in flat_probs:
@@ -261,6 +261,49 @@ HTML_TEMPLATE = """
         color: #444;
       }
 
+      .delta-log {
+        margin-top: 24px;
+        border-top: 1px solid #ddd;
+        padding-top: 16px;
+      }
+
+      .delta-log h2 {
+        margin-bottom: 10px;
+      }
+
+      .delta-log-grid {
+        display: grid;
+        gap: 6px;
+        overflow-x: auto;
+      }
+
+      .delta-log-row {
+        display: grid;
+        gap: 6px;
+      }
+
+      .delta-log-cell {
+        min-width: 52px;
+        padding: 6px 4px;
+        font-size: 11px;
+        text-align: center;
+        border: 1px solid #ddd;
+        border-radius: 4px;
+        font-variant-numeric: tabular-nums;
+        background: #fff;
+      }
+
+      .delta-log-header .delta-log-cell {
+        font-weight: 600;
+        background: #f5f5f5;
+      }
+
+      .delta-log-empty {
+        margin: 0;
+        font-size: 12px;
+        color: #666;
+      }
+
       img {
         display: block;
         width: 100%;
@@ -315,6 +358,11 @@ HTML_TEMPLATE = """
             <div id="encode-status" class="status-text"></div>
           </div>
         </div>
+        <section class="delta-log">
+          <h2>Latent Delta Log</h2>
+          <p id="delta-log-empty" class="delta-log-empty">Scrub between frames to log latent changes.</p>
+          <div id="delta-log" class="delta-log-grid" hidden></div>
+        </section>
       </section>
     </div>
 
@@ -330,10 +378,14 @@ HTML_TEMPLATE = """
       const recordingSelect = document.getElementById("recording-select");
       const frameScrubber = document.getElementById("frame-scrubber");
       const scrubberMeta = document.getElementById("scrubber-meta");
+      const deltaLog = document.getElementById("delta-log");
+      const deltaLogEmpty = document.getElementById("delta-log-empty");
       const modeInputs = [...document.querySelectorAll('input[name="decode-mode"]')];
       let currentLatentDim = 0;
       let currentFrames = [];
       let lastEncodedLatent = null;
+      let lastEncodedFrameMeta = null;
+      let deltaLogEntries = [];
 
       function getSelectedModel() {
         return modelOptions.find((model) => model.key === modelSelect.value);
@@ -436,6 +488,65 @@ HTML_TEMPLATE = """
         return maxDelta;
       }
 
+      function buildDeltaLogHeader() {
+        const headerRow = document.createElement("div");
+        headerRow.className = "delta-log-row delta-log-header";
+        headerRow.style.gridTemplateColumns = `repeat(${currentLatentDim}, minmax(52px, 1fr))`;
+
+        for (let i = 0; i < currentLatentDim; i += 1) {
+          const cell = document.createElement("div");
+          cell.className = "delta-log-cell";
+          cell.textContent = `z${i}`;
+          headerRow.appendChild(cell);
+        }
+
+        return headerRow;
+      }
+
+      function renderDeltaLog() {
+        if (!deltaLogEntries.length) {
+          deltaLog.hidden = true;
+          deltaLogEmpty.hidden = false;
+          return;
+        }
+
+        deltaLog.hidden = false;
+        deltaLogEmpty.hidden = true;
+        deltaLog.replaceChildren();
+        deltaLog.appendChild(buildDeltaLogHeader());
+
+        for (const entry of deltaLogEntries) {
+          const row = document.createElement("div");
+          row.className = "delta-log-row";
+          row.style.gridTemplateColumns = `repeat(${entry.deltas.length}, minmax(52px, 1fr))`;
+
+          for (const delta of entry.deltas) {
+            const cell = document.createElement("div");
+            cell.className = "delta-log-cell";
+            cell.textContent = `${delta >= 0 ? "+" : ""}${delta.toFixed(2)}`;
+            row.appendChild(cell);
+          }
+
+          deltaLog.appendChild(row);
+        }
+      }
+
+      function resetDeltaLog() {
+        deltaLogEntries = [];
+        renderDeltaLog();
+      }
+
+      function appendDeltaLog(previousLatent, nextLatent, previousFrameMeta, nextFrameMeta) {
+        if (!previousFrameMeta || !nextFrameMeta) {
+          return;
+        }
+        deltaLogEntries.unshift({
+          deltas: nextLatent.map((value, index) => value - previousLatent[index]),
+        });
+        deltaLogEntries = deltaLogEntries.slice(0, 5);
+        renderDeltaLog();
+      }
+
       async function render() {
         const params = new URLSearchParams();
         params.set("model", modelSelect.value);
@@ -461,16 +572,21 @@ HTML_TEMPLATE = """
         if (!recordingSelect.value) {
           currentFrames = [];
           lastEncodedLatent = null;
+          lastEncodedFrameMeta = null;
           frameScrubber.min = "0";
           frameScrubber.max = "0";
           frameScrubber.value = "0";
           scrubberMeta.textContent = "No recording selected.";
           encodeStatus.textContent = "";
           inputImage.removeAttribute("src");
+          resetDeltaLog();
           render();
           return;
         }
 
+        lastEncodedLatent = null;
+        lastEncodedFrameMeta = null;
+        resetDeltaLog();
         const response = await fetch(`/api/recordings/${encodeURIComponent(recordingSelect.value)}`);
         const payload = await response.json();
         currentFrames = payload.frames;
@@ -506,14 +622,22 @@ HTML_TEMPLATE = """
         const response = await fetch(`/api/encode_state?${params.toString()}`);
         const payload = await response.json();
         const delta = maxLatentDelta(payload.latent);
+        const previousLatent = lastEncodedLatent;
+        const previousFrameMeta = lastEncodedFrameMeta;
+        const nextFrameMeta = {
+          frameIndex: payload.frame_index,
+          timestamp: payload.timestamp,
+        };
         setLatents(payload.latent);
         lastEncodedLatent = payload.latent;
+        lastEncodedFrameMeta = nextFrameMeta;
         if (delta === null) {
           encodeStatus.textContent = `Encoded selected frame at ${payload.timestamp}.`;
         } else if (delta < 1e-6) {
           encodeStatus.textContent = "Encoded latent unchanged for this selected frame.";
         } else {
           encodeStatus.textContent = `Encoded latent changed. Max delta: ${delta.toFixed(4)}.`;
+          appendDeltaLog(previousLatent, payload.latent, previousFrameMeta, nextFrameMeta);
         }
       }
 
@@ -535,6 +659,9 @@ HTML_TEMPLATE = """
 
       modelSelect.addEventListener("change", () => {
         const model = getSelectedModel();
+        lastEncodedLatent = null;
+        lastEncodedFrameMeta = null;
+        resetDeltaLog();
         if (!model || model.latent_dim === currentLatentDim) {
           if (currentFrames.length) {
             renderFromSelectedFrame();
