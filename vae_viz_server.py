@@ -1,0 +1,807 @@
+from __future__ import annotations
+
+import argparse
+import io
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from flask import Flask, jsonify, render_template_string, request, send_file
+import mlx.core as mx
+import numpy as np
+
+from agents.templates.random_vae_agent import ConvVAE
+from agents.recorder import RECORDING_SUFFIX
+from view_utils import create_grid_image
+
+
+@dataclass(frozen=True)
+class ModelPaths:
+    config_path: Path
+    weights_path: Path
+
+
+@dataclass(frozen=True)
+class RecordingFrame:
+    index: int
+    timestamp: str
+    grid: list[list[int]]
+
+
+def list_model_paths(runs_dir: Path) -> list[ModelPaths]:
+    model_paths: list[ModelPaths] = []
+    for config_path in sorted(runs_dir.glob("**/vae_model_*.json")):
+        weights_path = config_path.with_suffix(".safetensors")
+        if weights_path.exists():
+            model_paths.append(ModelPaths(config_path=config_path, weights_path=weights_path))
+    return model_paths
+
+
+def find_latest_model_paths(runs_dir: Path) -> ModelPaths:
+    model_paths = list_model_paths(runs_dir)
+    if not model_paths:
+        raise FileNotFoundError(
+            f"No VAE config files found under {runs_dir}. "
+            "Pass --config and --weights explicitly."
+        )
+
+    return max(model_paths, key=lambda paths: paths.config_path.stat().st_mtime)
+
+
+def list_recording_paths(recordings_dir: Path) -> list[Path]:
+    return sorted(recordings_dir.glob(f"*{RECORDING_SUFFIX}"))
+
+
+def load_recording_frames(recording_path: Path) -> list[RecordingFrame]:
+    frames: list[RecordingFrame] = []
+    with recording_path.open(encoding="utf-8") as handle:
+        for line in handle:
+            event = json.loads(line)
+            data = event.get("data", {})
+            frame = data.get("frame")
+            if not frame or not isinstance(frame, list):
+                continue
+            grid = frame[-1]
+            if len(grid) != 64 or len(grid[0]) != 64:
+                continue
+            frames.append(
+                RecordingFrame(
+                    index=len(frames),
+                    timestamp=str(event.get("timestamp", "")),
+                    grid=grid,
+                )
+            )
+    return frames
+
+
+class VAEVisualizer:
+    def __init__(self, config_path: Path, weights_path: Path) -> None:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        self.config_path = config_path
+        self.weights_path = weights_path
+        self.latent_dim = int(config["latent_dim"])
+
+        self.vae = ConvVAE(
+            input_channels=int(config["input_channels"]),
+            output_channels=int(config["output_channels"]),
+            latent_dim=self.latent_dim,
+        )
+        self.vae.load_weights(str(weights_path))
+        self.vae.eval()
+
+    def decode_grid(self, latent_values: list[float], mode: str) -> np.ndarray:
+        latent = np.asarray(latent_values, dtype=np.float32)
+        if latent.shape != (self.latent_dim,):
+            raise ValueError(
+                f"Expected {self.latent_dim} latent values, got {latent.shape[0]}."
+            )
+
+        decoded = self.vae.decoder(mx.array(latent[None, :]))
+        decoded_np = np.asarray(decoded)[0]
+
+        if mode == "sample":
+            probs = np.clip(decoded_np, 0.0, None)
+            probs_sum = np.clip(probs.sum(axis=-1, keepdims=True), 1e-8, None)
+            probs = probs / probs_sum
+            flat_probs = probs.reshape(-1, probs.shape[-1])
+            sampled = []
+            for row in flat_probs:
+                normalized = np.asarray(row, dtype=np.float64)
+                normalized_sum = float(normalized.sum())
+                if normalized_sum <= 0:
+                    normalized = np.full_like(normalized, 1.0 / normalized.shape[0])
+                else:
+                    normalized = normalized / normalized_sum
+                normalized[-1] = 1.0 - normalized[:-1].sum()
+                normalized = np.clip(normalized, 0.0, 1.0)
+                normalized = normalized / normalized.sum()
+                sampled.append(np.random.choice(normalized.shape[0], p=normalized))
+            return np.asarray(sampled, dtype=np.int64).reshape(64, 64)
+
+        return np.argmax(decoded_np, axis=-1).astype(np.int64)
+
+    def encode_grid(self, grid: list[list[int]]) -> list[float]:
+        frame = np.asarray(grid, dtype=np.int64)
+        if frame.shape != (64, 64):
+            raise ValueError(f"Expected a 64x64 grid, got {frame.shape}.")
+
+        tensor = np.eye(self.vae.input_channels, dtype=np.float32)[frame]
+        mu, _ = self.vae.encoder(mx.array(tensor[None, :, :, :]))
+        return np.asarray(mu)[0].astype(np.float32).tolist()
+
+
+HTML_TEMPLATE = """
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>ConvVAE Latent Visualizer</title>
+    <style>
+      body {
+        margin: 24px;
+        font-family: sans-serif;
+      }
+
+      h1, h2 {
+        margin-top: 0;
+        margin-bottom: 16px;
+        font-weight: 600;
+      }
+
+      .layout {
+        display: flex;
+        align-items: flex-start;
+        gap: 24px;
+      }
+
+      .controls {
+        width: 220px;
+      }
+
+      .model-select {
+        width: 100%;
+        margin-bottom: 16px;
+        padding: 6px 8px;
+        font: inherit;
+      }
+
+      .input-controls {
+        margin-bottom: 16px;
+      }
+
+      .input-controls label {
+        display: block;
+        margin-bottom: 6px;
+        font-size: 13px;
+      }
+
+      .mode-toggle {
+        margin-bottom: 16px;
+        font-size: 13px;
+      }
+
+      .mode-toggle label {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        margin-bottom: 6px;
+      }
+
+      .scrubber {
+        width: 100%;
+      }
+
+      .scrubber-meta {
+        margin-top: 6px;
+        font-size: 12px;
+        color: #444;
+      }
+
+      .slider-list {
+        display: grid;
+        gap: 10px;
+        margin-bottom: 20px;
+      }
+
+      .slider-row {
+        display: grid;
+        grid-template-columns: 48px 1fr 52px;
+        align-items: center;
+        gap: 10px;
+      }
+
+      input[type="range"] {
+        width: 100%;
+      }
+
+      .slider-range,
+      .slider-value {
+        font-size: 12px;
+        color: #444;
+      }
+
+      .slider-value {
+        text-align: right;
+        font-variant-numeric: tabular-nums;
+      }
+
+      button {
+        padding: 8px 14px;
+        font: inherit;
+        cursor: pointer;
+      }
+
+      .preview {
+        display: flex;
+        flex-direction: column;
+        flex: 1 1 0;
+        min-width: 0;
+      }
+
+      .preview-grid {
+        display: flex;
+        gap: 24px;
+        align-items: flex-start;
+        width: 100%;
+      }
+
+      .preview-panel {
+        flex: 1 1 0;
+      }
+
+      .preview-panel h2 {
+        margin-bottom: 8px;
+      }
+
+      .status-text {
+        margin-top: 8px;
+        font-size: 12px;
+        color: #444;
+      }
+
+      img {
+        display: block;
+        width: 100%;
+        height: auto;
+        image-rendering: pixelated;
+      }
+
+      @media (max-width: 900px) {
+        .layout {
+          flex-direction: column;
+        }
+
+        .controls {
+          width: 100%;
+        }
+
+        img {
+          width: 100%;
+          max-width: 640px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="layout">
+      <section class="controls">
+        <h1>Z</h1>
+        <select id="model-select" class="model-select"></select>
+        <div class="input-controls">
+          <label for="recording-select">Initial state recording</label>
+          <select id="recording-select" class="model-select"></select>
+          <input id="frame-scrubber" class="scrubber" type="range" min="0" max="0" step="1" value="0">
+          <div id="scrubber-meta" class="scrubber-meta">No recording selected.</div>
+        </div>
+        <div class="mode-toggle">
+          <label><input type="radio" name="decode-mode" value="argmax" checked> Argmax</label>
+          <label><input type="radio" name="decode-mode" value="sample"> Sample</label>
+        </div>
+        <div class="slider-list" id="sliders"></div>
+        <button id="random">Randomize Z</button>
+      </section>
+
+      <section class="preview">
+        <div class="preview-grid">
+          <div class="preview-panel">
+            <h2>Initial State</h2>
+            <img id="input-image" alt="Selected recorded frame">
+          </div>
+          <div class="preview-panel">
+            <h2>Reconstruction</h2>
+            <img id="grid-image" alt="Decoded ARC grid">
+            <div id="encode-status" class="status-text"></div>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <script>
+      const modelOptions = {{ model_options|tojson }};
+      const initialModelKey = {{ selected_model_key|tojson }};
+      const recordingOptions = {{ recording_options|tojson }};
+      const sliderContainer = document.getElementById("sliders");
+      const gridImage = document.getElementById("grid-image");
+      const inputImage = document.getElementById("input-image");
+      const encodeStatus = document.getElementById("encode-status");
+      const modelSelect = document.getElementById("model-select");
+      const recordingSelect = document.getElementById("recording-select");
+      const frameScrubber = document.getElementById("frame-scrubber");
+      const scrubberMeta = document.getElementById("scrubber-meta");
+      const modeInputs = [...document.querySelectorAll('input[name="decode-mode"]')];
+      let currentLatentDim = 0;
+      let currentFrames = [];
+      let lastEncodedLatent = null;
+
+      function getSelectedModel() {
+        return modelOptions.find((model) => model.key === modelSelect.value);
+      }
+
+      function buildModelOptions() {
+        for (const model of modelOptions) {
+          const option = document.createElement("option");
+          option.value = model.key;
+          option.textContent = model.label;
+          modelSelect.appendChild(option);
+        }
+        modelSelect.value = initialModelKey;
+      }
+
+      function buildRecordingOptions() {
+        const emptyOption = document.createElement("option");
+        emptyOption.value = "";
+        emptyOption.textContent = "None";
+        recordingSelect.appendChild(emptyOption);
+
+        for (const recording of recordingOptions) {
+          const option = document.createElement("option");
+          option.value = recording.key;
+          option.textContent = recording.label;
+          recordingSelect.appendChild(option);
+        }
+      }
+
+      function getDecodeMode() {
+        const selected = modeInputs.find((input) => input.checked);
+        return selected ? selected.value : "argmax";
+      }
+
+      function buildSlider(index) {
+        const row = document.createElement("div");
+        row.className = "slider-row";
+
+        const range = document.createElement("span");
+        range.className = "slider-range";
+        range.textContent = "[-3, 3]";
+
+        const input = document.createElement("input");
+        input.type = "range";
+        input.min = "-3";
+        input.max = "3";
+        input.step = "0.01";
+        input.value = "0";
+        input.dataset.index = String(index);
+        input.addEventListener("input", () => {
+          value.textContent = Number(input.value).toFixed(2);
+          render();
+        });
+
+        const value = document.createElement("span");
+        value.className = "slider-value";
+        value.textContent = "0.00";
+        value.dataset.valueFor = String(index);
+
+        row.appendChild(range);
+        row.appendChild(input);
+        row.appendChild(value);
+        sliderContainer.appendChild(row);
+      }
+
+      function rebuildSliders(latentDim) {
+        sliderContainer.replaceChildren();
+        currentLatentDim = latentDim;
+        for (let i = 0; i < latentDim; i += 1) {
+          buildSlider(i);
+        }
+      }
+
+      function getLatents() {
+        return [...document.querySelectorAll('input[type="range"]')].map(
+          (input) => input.id === "frame-scrubber" ? null : Number(input.value)
+        ).filter((value) => value !== null);
+      }
+
+      function setLatents(latents) {
+        for (const [index, value] of latents.entries()) {
+          const input = document.querySelector(`input[data-index="${index}"]`);
+          if (!input) {
+            continue;
+          }
+          const nextValue = Number(value).toFixed(2);
+          input.value = nextValue;
+          document.querySelector(`[data-value-for="${index}"]`).textContent = nextValue;
+        }
+      }
+
+      function maxLatentDelta(nextLatent) {
+        if (!lastEncodedLatent || lastEncodedLatent.length !== nextLatent.length) {
+          return null;
+        }
+        let maxDelta = 0;
+        for (let i = 0; i < nextLatent.length; i += 1) {
+          maxDelta = Math.max(maxDelta, Math.abs(nextLatent[i] - lastEncodedLatent[i]));
+        }
+        return maxDelta;
+      }
+
+      async function render() {
+        const params = new URLSearchParams();
+        params.set("model", modelSelect.value);
+        params.set("mode", getDecodeMode());
+        params.set("latent", JSON.stringify(getLatents()));
+        gridImage.src = `/sample.png?${params.toString()}&t=${Date.now()}`;
+      }
+
+      function renderFromSelectedFrame() {
+        if (!currentFrames.length) {
+          render();
+          return;
+        }
+        const params = new URLSearchParams();
+        params.set("model", modelSelect.value);
+        params.set("mode", getDecodeMode());
+        params.set("recording", recordingSelect.value);
+        params.set("frame_index", frameScrubber.value);
+        gridImage.src = `/reconstruct_state.png?${params.toString()}&t=${Date.now()}`;
+      }
+
+      async function loadRecordingFrames() {
+        if (!recordingSelect.value) {
+          currentFrames = [];
+          lastEncodedLatent = null;
+          frameScrubber.min = "0";
+          frameScrubber.max = "0";
+          frameScrubber.value = "0";
+          scrubberMeta.textContent = "No recording selected.";
+          encodeStatus.textContent = "";
+          inputImage.removeAttribute("src");
+          render();
+          return;
+        }
+
+        const response = await fetch(`/api/recordings/${encodeURIComponent(recordingSelect.value)}`);
+        const payload = await response.json();
+        currentFrames = payload.frames;
+        frameScrubber.min = "0";
+        frameScrubber.max = String(Math.max(0, currentFrames.length - 1));
+        frameScrubber.value = "0";
+        updateScrubberMeta();
+        await encodeSelectedFrame();
+      }
+
+      function updateScrubberMeta() {
+        if (!currentFrames.length) {
+          scrubberMeta.textContent = "No recording selected.";
+          return;
+        }
+        const frame = currentFrames[Number(frameScrubber.value)];
+        scrubberMeta.textContent = `Frame ${frame.index + 1}/${currentFrames.length}  ${frame.timestamp}`;
+        const params = new URLSearchParams();
+        params.set("recording", recordingSelect.value);
+        params.set("frame_index", frameScrubber.value);
+        inputImage.src = `/recording_frame.png?${params.toString()}&t=${Date.now()}`;
+      }
+
+      async function encodeSelectedFrame() {
+        if (!currentFrames.length) {
+          return;
+        }
+
+        const params = new URLSearchParams();
+        params.set("model", modelSelect.value);
+        params.set("recording", recordingSelect.value);
+        params.set("frame_index", frameScrubber.value);
+        const response = await fetch(`/api/encode_state?${params.toString()}`);
+        const payload = await response.json();
+        const delta = maxLatentDelta(payload.latent);
+        setLatents(payload.latent);
+        lastEncodedLatent = payload.latent;
+        if (delta === null) {
+          encodeStatus.textContent = `Encoded selected frame at ${payload.timestamp}.`;
+        } else if (delta < 1e-6) {
+          encodeStatus.textContent = "Encoded latent unchanged for this selected frame.";
+        } else {
+          encodeStatus.textContent = `Encoded latent changed. Max delta: ${delta.toFixed(4)}.`;
+        }
+      }
+
+      document.getElementById("random").addEventListener("click", () => {
+        for (const input of document.querySelectorAll('input[type="range"]')) {
+          if (input.id === "frame-scrubber") {
+            continue;
+          }
+          const u1 = Math.max(Math.random(), 1e-12);
+          const u2 = Math.random();
+          const standardNormal = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+          const nextValue = Math.max(-3, Math.min(3, standardNormal)).toFixed(2);
+          input.value = nextValue;
+          document.querySelector(`[data-value-for="${input.dataset.index}"]`).textContent = nextValue;
+        }
+        encodeStatus.textContent = "Using randomized latent.";
+        render();
+      });
+
+      modelSelect.addEventListener("change", () => {
+        const model = getSelectedModel();
+        if (!model || model.latent_dim === currentLatentDim) {
+          if (currentFrames.length) {
+            renderFromSelectedFrame();
+            encodeSelectedFrame();
+          } else {
+            render();
+          }
+          return;
+        }
+        rebuildSliders(model.latent_dim);
+        if (currentFrames.length) {
+          renderFromSelectedFrame();
+          encodeSelectedFrame();
+        } else {
+          render();
+        }
+      });
+
+      recordingSelect.addEventListener("change", loadRecordingFrames);
+      frameScrubber.addEventListener("input", () => {
+        updateScrubberMeta();
+        renderFromSelectedFrame();
+        encodeSelectedFrame();
+      });
+      for (const input of modeInputs) {
+        input.addEventListener("change", () => {
+          if (currentFrames.length) {
+            renderFromSelectedFrame();
+          } else {
+            render();
+          }
+        });
+      }
+
+      buildModelOptions();
+      buildRecordingOptions();
+      rebuildSliders(getSelectedModel().latent_dim);
+      loadRecordingFrames();
+    </script>
+  </body>
+</html>
+"""
+
+
+def parse_latent_arg(raw_latent: str | None, latent_dim: int) -> list[float]:
+    if raw_latent is None:
+        return [0.0] * latent_dim
+
+    values = json.loads(raw_latent)
+    if not isinstance(values, list):
+        raise ValueError("latent must be a JSON array")
+    if len(values) != latent_dim:
+        raise ValueError(f"latent must contain exactly {latent_dim} values")
+    return [float(value) for value in values]
+
+
+def create_app(
+    model_paths_list: list[ModelPaths],
+    selected_model_key: str,
+    recordings_dir: Path,
+) -> Flask:
+    app = Flask(__name__)
+    visualizers: dict[str, VAEVisualizer] = {}
+    model_options: list[dict[str, Any]] = []
+    recording_frames_by_key: dict[str, list[RecordingFrame]] = {}
+    recording_options: list[dict[str, str]] = []
+
+    for model_paths in model_paths_list:
+        model_key = str(model_paths.weights_path)
+        visualizer = VAEVisualizer(
+            config_path=model_paths.config_path,
+            weights_path=model_paths.weights_path,
+        )
+        visualizers[model_key] = visualizer
+        model_options.append(
+            {
+                "key": model_key,
+                "label": str(model_paths.weights_path),
+                "latent_dim": visualizer.latent_dim,
+            }
+        )
+
+    for recording_path in list_recording_paths(recordings_dir):
+        key = recording_path.name
+        frames = load_recording_frames(recording_path)
+        if not frames:
+            continue
+        recording_frames_by_key[key] = frames
+        recording_options.append({"key": key, "label": key})
+
+    if selected_model_key not in visualizers:
+        raise ValueError(f"Unknown selected model: {selected_model_key}")
+
+    @app.get("/")
+    def index() -> str:
+        return render_template_string(
+            HTML_TEMPLATE,
+            model_options=model_options,
+            selected_model_key=selected_model_key,
+            recording_options=recording_options,
+        )
+
+    def get_visualizer() -> VAEVisualizer:
+        model_key = request.args.get("model", selected_model_key)
+        visualizer = visualizers.get(model_key)
+        if visualizer is None:
+            raise ValueError(f"Unknown model: {model_key}")
+        return visualizer
+
+    def get_recording_frame() -> RecordingFrame:
+        recording_key = request.args.get("recording")
+        if not recording_key:
+            raise ValueError("Missing recording.")
+        frames = recording_frames_by_key.get(recording_key)
+        if frames is None:
+            raise ValueError(f"Unknown recording: {recording_key}")
+        frame_index = int(request.args.get("frame_index", "0"))
+        if frame_index < 0 or frame_index >= len(frames):
+            raise ValueError(f"Frame index out of range: {frame_index}")
+        return frames[frame_index]
+
+    @app.get("/api/sample")
+    def sample_json() -> Any:
+        visualizer = get_visualizer()
+        latent_values = parse_latent_arg(request.args.get("latent"), visualizer.latent_dim)
+        mode = request.args.get("mode", "argmax")
+        if mode not in {"argmax", "sample"}:
+            return jsonify({"error": "mode must be 'argmax' or 'sample'"}), 400
+
+        grid = visualizer.decode_grid(latent_values, mode=mode)
+        return jsonify(
+            {
+                "latent": latent_values,
+                "mode": mode,
+                "grid": grid.tolist(),
+            }
+        )
+
+    @app.get("/sample.png")
+    def sample_png() -> Any:
+        visualizer = get_visualizer()
+        latent_values = parse_latent_arg(request.args.get("latent"), visualizer.latent_dim)
+        mode = request.args.get("mode", "argmax")
+        if mode not in {"argmax", "sample"}:
+            return jsonify({"error": "mode must be 'argmax' or 'sample'"}), 400
+
+        grid = visualizer.decode_grid(latent_values, mode=mode)
+        image = create_grid_image(grid, cell_size=8, border_width=1)
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        buffer.seek(0)
+        return send_file(buffer, mimetype="image/png")
+
+    @app.get("/recording_frame.png")
+    def recording_frame_png() -> Any:
+        frame = get_recording_frame()
+        image = create_grid_image(np.asarray(frame.grid, dtype=np.int64), cell_size=8, border_width=1)
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        buffer.seek(0)
+        return send_file(buffer, mimetype="image/png")
+
+    @app.get("/reconstruct_state.png")
+    def reconstruct_state_png() -> Any:
+        visualizer = get_visualizer()
+        frame = get_recording_frame()
+        mode = request.args.get("mode", "argmax")
+        if mode not in {"argmax", "sample"}:
+            return jsonify({"error": "mode must be 'argmax' or 'sample'"}), 400
+        latent = visualizer.encode_grid(frame.grid)
+        grid = visualizer.decode_grid(latent, mode=mode)
+        image = create_grid_image(grid, cell_size=8, border_width=1)
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        buffer.seek(0)
+        return send_file(buffer, mimetype="image/png")
+
+    @app.get("/api/models")
+    def models_json() -> Any:
+        return jsonify(
+            {
+                "models": model_options,
+                "selected_model_key": selected_model_key,
+            }
+        )
+
+    @app.get("/api/recordings")
+    def recordings_json() -> Any:
+        return jsonify({"recordings": recording_options})
+
+    @app.get("/api/recordings/<recording_key>")
+    def recording_frames_json(recording_key: str) -> Any:
+        frames = recording_frames_by_key.get(recording_key)
+        if frames is None:
+            return jsonify({"error": f"Unknown recording: {recording_key}"}), 404
+        return jsonify(
+            {
+                "frames": [
+                    {"index": frame.index, "timestamp": frame.timestamp}
+                    for frame in frames
+                ]
+            }
+        )
+
+    @app.get("/api/encode_state")
+    def encode_state() -> Any:
+        visualizer = get_visualizer()
+        frame = get_recording_frame()
+        return jsonify(
+            {
+                "latent": visualizer.encode_grid(frame.grid),
+                "timestamp": frame.timestamp,
+                "frame_index": frame.index,
+            }
+        )
+
+    return app
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Visualize ConvVAE latent dimensions.")
+    parser.add_argument("--host", default="127.0.0.1", help="Host interface to bind.")
+    parser.add_argument("--port", default=5001, type=int, help="Port to listen on.")
+    parser.add_argument("--runs-dir", default="runs", help="Directory to scan for saved VAE runs.")
+    parser.add_argument("--recordings-dir", default="recordings", help="Directory to scan for saved recordings.")
+    parser.add_argument("--config", help="Path to the VAE config JSON.")
+    parser.add_argument("--weights", help="Path to the VAE weights safetensors file.")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    if args.config or args.weights:
+        if not args.config or not args.weights:
+            raise ValueError("Pass both --config and --weights together.")
+        model_paths_list = [
+            ModelPaths(
+                config_path=Path(args.config),
+                weights_path=Path(args.weights),
+            )
+        ]
+        selected_model = model_paths_list[0]
+    else:
+        runs_dir = Path(args.runs_dir)
+        model_paths_list = list_model_paths(runs_dir)
+        if not model_paths_list:
+            raise FileNotFoundError(
+                f"No VAE config files found under {runs_dir}. "
+                "Pass --config and --weights explicitly."
+            )
+        selected_model = find_latest_model_paths(runs_dir)
+
+    app = create_app(
+        model_paths_list=model_paths_list,
+        selected_model_key=str(selected_model.weights_path),
+        recordings_dir=Path(args.recordings_dir),
+    )
+    app.run(
+        host=args.host,
+        port=args.port,
+        debug=False,
+        threaded=False,
+        use_reloader=False,
+    )
+    
+
+
+if __name__ == "__main__":
+    main()

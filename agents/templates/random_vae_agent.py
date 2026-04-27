@@ -83,7 +83,7 @@ class ConvVAE(nn.Module):
     """
     https://arxiv.org/pdf/1803.10122
     """
-    def __init__(self, input_channels, output_channels, latent_dim = 32):
+    def __init__(self, input_channels, output_channels, latent_dim):
         super().__init__()
         self.input_channels = input_channels
         self.output_channels = output_channels
@@ -103,7 +103,7 @@ class ConvVAE(nn.Module):
         return reconstruction, mu, log_var
     
 
-def vae_loss(reconstruction, x, mu, log_var):
+def vae_loss(reconstruction, x, mu, log_var, beta=10.0):
     # Reconstruction loss (L2 as described in paper)
     recon_loss_per_example = mx.sum(mx.square(reconstruction - x), axis=(1, 2, 3))
     # KL divergence
@@ -115,7 +115,7 @@ def vae_loss(reconstruction, x, mu, log_var):
     recon_loss = mx.mean(recon_loss_per_example)
     kl_loss = mx.mean(kl_loss_per_example)
 
-    total_loss = recon_loss + kl_loss
+    total_loss = recon_loss * beta + kl_loss
     return total_loss, recon_loss, kl_loss
 
 
@@ -141,8 +141,6 @@ class RandomVAE(Agent):
 
         # Model and training
         self.train_frequency = 5
-        self.vae = ConvVAE(input_channels=self.num_colours, output_channels=self.num_colours, latent_dim=16)
-
         self.experience_buffer: deque[Experience] = deque(maxlen=200_000)
         self.experience_hashes = set()  # Track unique frames
         self.batch_size = 64
