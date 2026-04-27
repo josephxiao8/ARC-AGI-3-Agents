@@ -13,6 +13,9 @@ dependencies = [
     "pillow>=11.2.1",
     "pydantic>=2.11.7",
     "requests>=2.32.4",
+    "setuptools==81.0.0",
+    "tensorboard>=2.20.0",
+    "tensorboardx>=2.6.5",
 ]
 
 [dependency-groups]
