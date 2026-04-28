@@ -5,6 +5,7 @@ import io
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Lock
 from typing import Any
 
 from flask import Flask, jsonify, render_template_string, request, send_file
@@ -31,10 +32,11 @@ class RecordingFrame:
 
 def list_model_paths(runs_dir: Path) -> list[ModelPaths]:
     model_paths: list[ModelPaths] = []
-    for config_path in sorted(runs_dir.glob("**/vae_model_*.json")):
-        weights_path = config_path.with_suffix(".safetensors")
-        if weights_path.exists():
-            model_paths.append(ModelPaths(config_path=config_path, weights_path=weights_path))
+    for run_dir in sorted(path for path in runs_dir.iterdir() if path.is_dir()):
+        for config_path in sorted(run_dir.glob("vae_model_*.json")):
+            weights_path = config_path.with_suffix(".safetensors")
+            if weights_path.exists():
+                model_paths.append(ModelPaths(config_path=config_path, weights_path=weights_path))
     return model_paths
 
 
@@ -81,23 +83,34 @@ class VAEVisualizer:
         self.config_path = config_path
         self.weights_path = weights_path
         self.latent_dim = int(config["latent_dim"])
+        self.input_channels = int(config["input_channels"])
+        self.output_channels = int(config["output_channels"])
+        self.vae: ConvVAE | None = None
+        self._load_lock = Lock()
 
-        self.vae = ConvVAE(
-            input_channels=int(config["input_channels"]),
-            output_channels=int(config["output_channels"]),
-            latent_dim=self.latent_dim,
-        )
-        self.vae.load_weights(str(weights_path))
-        self.vae.eval()
+    def _get_vae(self) -> ConvVAE:
+        if self.vae is None:
+            with self._load_lock:
+                if self.vae is None:
+                    vae = ConvVAE(
+                        input_channels=self.input_channels,
+                        output_channels=self.output_channels,
+                        latent_dim=self.latent_dim,
+                    )
+                    vae.load_weights(str(self.weights_path))
+                    vae.eval()
+                    self.vae = vae
+        return self.vae
 
     def decode_grid(self, latent_values: list[float], mode: str) -> np.ndarray:
+        vae = self._get_vae()
         latent = np.asarray(latent_values, dtype=np.float32)
         if latent.shape != (self.latent_dim,):
             raise ValueError(
                 f"Expected {self.latent_dim} latent values, got {latent.shape[0]}."
             )
 
-        decoded = self.vae.decoder(mx.array(latent[None, :]))
+        decoded = vae.decoder(mx.array(latent[None, :]))
         decoded_np = np.asarray(decoded)[0]
 
         if mode == "sample":
@@ -122,12 +135,13 @@ class VAEVisualizer:
         return np.argmax(decoded_np, axis=-1).astype(np.int64)
 
     def encode_grid(self, grid: list[list[int]]) -> list[float]:
+        vae = self._get_vae()
         frame = np.asarray(grid, dtype=np.int64)
         if frame.shape != (64, 64):
             raise ValueError(f"Expected a 64x64 grid, got {frame.shape}.")
 
-        tensor = np.eye(self.vae.input_channels, dtype=np.float32)[frame]
-        mu, _ = self.vae.encoder(mx.array(tensor[None, :, :, :]))
+        tensor = np.eye(vae.input_channels, dtype=np.float32)[frame]
+        mu, _ = vae.encoder(mx.array(tensor[None, :, :, :]))
         return np.asarray(mu)[0].astype(np.float32).tolist()
 
 
@@ -261,6 +275,10 @@ HTML_TEMPLATE = """
         color: #444;
       }
 
+      .status-text.is-loading {
+        color: #8a5a00;
+      }
+
       .delta-log {
         margin-top: 24px;
         border-top: 1px solid #ddd;
@@ -337,6 +355,7 @@ HTML_TEMPLATE = """
           <select id="recording-select" class="model-select"></select>
           <input id="frame-scrubber" class="scrubber" type="range" min="0" max="0" step="1" value="0">
           <div id="scrubber-meta" class="scrubber-meta">No recording selected.</div>
+          <div id="recording-status" class="status-text"></div>
         </div>
         <div class="mode-toggle">
           <label><input type="radio" name="decode-mode" value="argmax" checked> Argmax</label>
@@ -378,6 +397,7 @@ HTML_TEMPLATE = """
       const recordingSelect = document.getElementById("recording-select");
       const frameScrubber = document.getElementById("frame-scrubber");
       const scrubberMeta = document.getElementById("scrubber-meta");
+      const recordingStatus = document.getElementById("recording-status");
       const deltaLog = document.getElementById("delta-log");
       const deltaLogEmpty = document.getElementById("delta-log-empty");
       const modeInputs = [...document.querySelectorAll('input[name="decode-mode"]')];
@@ -386,6 +406,7 @@ HTML_TEMPLATE = """
       let lastEncodedLatent = null;
       let lastEncodedFrameMeta = null;
       let deltaLogEntries = [];
+      let recordingLoadRequestId = 0;
 
       function getSelectedModel() {
         return modelOptions.find((model) => model.key === modelSelect.value);
@@ -536,6 +557,13 @@ HTML_TEMPLATE = """
         renderDeltaLog();
       }
 
+      function setRecordingLoading(isLoading, message = "") {
+        recordingStatus.textContent = message;
+        recordingStatus.classList.toggle("is-loading", isLoading);
+        recordingSelect.disabled = isLoading;
+        frameScrubber.disabled = isLoading || !currentFrames.length;
+      }
+
       function appendDeltaLog(previousLatent, nextLatent, previousFrameMeta, nextFrameMeta) {
         if (!previousFrameMeta || !nextFrameMeta) {
           return;
@@ -569,6 +597,9 @@ HTML_TEMPLATE = """
       }
 
       async function loadRecordingFrames() {
+        const requestId = recordingLoadRequestId + 1;
+        recordingLoadRequestId = requestId;
+
         if (!recordingSelect.value) {
           currentFrames = [];
           lastEncodedLatent = null;
@@ -577,6 +608,7 @@ HTML_TEMPLATE = """
           frameScrubber.max = "0";
           frameScrubber.value = "0";
           scrubberMeta.textContent = "No recording selected.";
+          setRecordingLoading(false, "");
           encodeStatus.textContent = "";
           inputImage.removeAttribute("src");
           resetDeltaLog();
@@ -587,14 +619,43 @@ HTML_TEMPLATE = """
         lastEncodedLatent = null;
         lastEncodedFrameMeta = null;
         resetDeltaLog();
-        const response = await fetch(`/api/recordings/${encodeURIComponent(recordingSelect.value)}`);
-        const payload = await response.json();
-        currentFrames = payload.frames;
+        const recordingLabel = recordingSelect.selectedOptions[0]?.textContent || recordingSelect.value;
+        currentFrames = [];
         frameScrubber.min = "0";
-        frameScrubber.max = String(Math.max(0, currentFrames.length - 1));
+        frameScrubber.max = "0";
         frameScrubber.value = "0";
-        updateScrubberMeta();
-        await encodeSelectedFrame();
+        scrubberMeta.textContent = "Loading recording frames...";
+        setRecordingLoading(true, `Loading ${recordingLabel}...`);
+
+        try {
+          const response = await fetch(`/api/recordings/${encodeURIComponent(recordingSelect.value)}`);
+          const payload = await response.json();
+          if (requestId !== recordingLoadRequestId) {
+            return;
+          }
+          if (!response.ok) {
+            throw new Error(payload.error || "Failed to load recording.");
+          }
+          currentFrames = payload.frames;
+          frameScrubber.min = "0";
+          frameScrubber.max = String(Math.max(0, currentFrames.length - 1));
+          frameScrubber.value = "0";
+          updateScrubberMeta();
+          setRecordingLoading(false, `Loaded ${currentFrames.length} frame${currentFrames.length === 1 ? "" : "s"}.`);
+          await encodeSelectedFrame();
+        } catch (error) {
+          if (requestId !== recordingLoadRequestId) {
+            return;
+          }
+          currentFrames = [];
+          frameScrubber.min = "0";
+          frameScrubber.max = "0";
+          frameScrubber.value = "0";
+          scrubberMeta.textContent = "Failed to load recording.";
+          inputImage.removeAttribute("src");
+          encodeStatus.textContent = "";
+          setRecordingLoading(false, error instanceof Error ? error.message : "Failed to load recording.");
+        }
       }
 
       function updateScrubberMeta() {
@@ -726,7 +787,9 @@ def create_app(
     app = Flask(__name__)
     visualizers: dict[str, VAEVisualizer] = {}
     model_options: list[dict[str, Any]] = []
+    recording_paths_by_key: dict[str, Path] = {}
     recording_frames_by_key: dict[str, list[RecordingFrame]] = {}
+    recording_frames_lock = Lock()
     recording_options: list[dict[str, str]] = []
 
     for model_paths in model_paths_list:
@@ -746,10 +809,7 @@ def create_app(
 
     for recording_path in list_recording_paths(recordings_dir):
         key = recording_path.name
-        frames = load_recording_frames(recording_path)
-        if not frames:
-            continue
-        recording_frames_by_key[key] = frames
+        recording_paths_by_key[key] = recording_path
         recording_options.append({"key": key, "label": key})
 
     if selected_model_key not in visualizers:
@@ -771,13 +831,27 @@ def create_app(
             raise ValueError(f"Unknown model: {model_key}")
         return visualizer
 
+    def get_recording_frames(recording_key: str) -> list[RecordingFrame]:
+        frames = recording_frames_by_key.get(recording_key)
+        if frames is not None:
+            return frames
+
+        recording_path = recording_paths_by_key.get(recording_key)
+        if recording_path is None:
+            raise ValueError(f"Unknown recording: {recording_key}")
+
+        with recording_frames_lock:
+            frames = recording_frames_by_key.get(recording_key)
+            if frames is None:
+                frames = load_recording_frames(recording_path)
+                recording_frames_by_key[recording_key] = frames
+        return frames
+
     def get_recording_frame() -> RecordingFrame:
         recording_key = request.args.get("recording")
         if not recording_key:
             raise ValueError("Missing recording.")
-        frames = recording_frames_by_key.get(recording_key)
-        if frames is None:
-            raise ValueError(f"Unknown recording: {recording_key}")
+        frames = get_recording_frames(recording_key)
         frame_index = int(request.args.get("frame_index", "0"))
         if frame_index < 0 or frame_index >= len(frames):
             raise ValueError(f"Frame index out of range: {frame_index}")
@@ -854,9 +928,9 @@ def create_app(
 
     @app.get("/api/recordings/<recording_key>")
     def recording_frames_json(recording_key: str) -> Any:
-        frames = recording_frames_by_key.get(recording_key)
-        if frames is None:
+        if recording_key not in recording_paths_by_key:
             return jsonify({"error": f"Unknown recording: {recording_key}"}), 404
+        frames = get_recording_frames(recording_key)
         return jsonify(
             {
                 "frames": [
@@ -913,7 +987,7 @@ def main() -> None:
                 f"No VAE config files found under {runs_dir}. "
                 "Pass --config and --weights explicitly."
             )
-        selected_model = find_latest_model_paths(runs_dir)
+        selected_model = max(model_paths_list, key=lambda paths: paths.config_path.stat().st_mtime)
 
     app = create_app(
         model_paths_list=model_paths_list,
