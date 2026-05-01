@@ -28,6 +28,7 @@ import hashlib
 class Encoder(nn.Module):
     def __init__(self, latent_dim: int, input_channels):
         super().__init__()
+        self.embedding = nn.Embedding(input_channels, input_channels)
         # 64x64xinput_channels -> 31x31x32
         self.conv1 = nn.Conv2d(input_channels, 32, kernel_size=4, stride=2, padding=0)
         # 31x31x32 -> 14x14x64
@@ -41,11 +42,21 @@ class Encoder(nn.Module):
         self.fc_mu = nn.Linear(1024, latent_dim)
         self.fc_logvar = nn.Linear(1024, latent_dim)
 
+        self.rmsNorm1 = nn.RMSNorm(32)
+        self.rmsNorm2 = nn.RMSNorm(64)
+        self.rmsNorm3 = nn.RMSNorm(128)
+        self.rmsNorm4 = nn.RMSNorm(256)
+
     def __call__(self, x: mx.array) -> Tuple[mx.array, mx.array]:
+        x = self.embedding(x)  # Apply identity embedding
         x = nn.relu(self.conv1(x))   # 31x31x32
+        x = self.rmsNorm1(x)
         x = nn.relu(self.conv2(x))   # 14x14x64
+        x = self.rmsNorm2(x)
         x = nn.relu(self.conv3(x))   # 6x6x128
+        x = self.rmsNorm3(x)
         x = nn.relu(self.conv4(x))   # 2x2x256
+        x = self.rmsNorm4(x)
 
         x = x.reshape(x.shape[0], -1)  # flatten -> (,1024)
         mu = self.fc_mu(x)
@@ -54,7 +65,7 @@ class Encoder(nn.Module):
 
 
 class Decoder(nn.Module):
-    def __init__(self, latent_dim: int, output_channels: int):
+    def __init__(self, latent_dim: int, output_channels: int, shared_embedding: nn.Embedding = None):
         super().__init__()
         # dense: latent_dim -> 1x1x1024
         self.fc = nn.Linear(latent_dim, 1024)
@@ -68,14 +79,28 @@ class Decoder(nn.Module):
         # 30x30x32 -> 64x64xoutput_channels
         self.deconv4 = nn.ConvTranspose2d(32, output_channels, kernel_size=6, stride=2, padding=0)
 
+        self.rmsNorm1 = nn.RMSNorm(128)
+        self.rmsNorm2 = nn.RMSNorm(64)
+        self.rmsNorm3 = nn.RMSNorm(32)
+        self.rmsNorm4 = nn.RMSNorm(output_channels)
+
+        self.embedding = shared_embedding if shared_embedding is not None else nn.Embedding(output_channels, output_channels)
+
     def __call__(self, z: mx.array) -> mx.array:
         x = self.fc(z)                           # 1024
         x = x.reshape(x.shape[0], 1, 1, 1024)   # 1x1x1024
 
         x = nn.relu(self.deconv1(x))             # 5x5x128
+        x = self.rmsNorm1(x)
         x = nn.relu(self.deconv2(x))             # 13x13x64
+        x = self.rmsNorm2(x)
         x = nn.relu(self.deconv3(x))             # 30x30x32
+        x = self.rmsNorm3(x)
         x = self.deconv4(x)                      # 64x64xoutput_channels, logits
+        x = self.rmsNorm4(x)
+        # project back into embedding space
+        x = self.embedding.as_linear(x)
+
         return x
 
 
@@ -89,7 +114,7 @@ class ConvVAE(nn.Module):
         self.output_channels = output_channels
         self.latent_dim = latent_dim
         self.encoder = Encoder(latent_dim, input_channels)
-        self.decoder = Decoder(latent_dim, output_channels)
+        self.decoder = Decoder(latent_dim, output_channels, shared_embedding=self.encoder.embedding)
 
     def reparameterize(self, mu: mx.array, log_var: mx.array) -> mx.array:
         std = mx.exp(0.5 * log_var)
@@ -122,7 +147,7 @@ def vae_loss(reconstruction, x, mu, log_var, weights, beta=10.0):
 
 @dataclass
 class Experience:
-    state: npt.NDArray[np.bool_]  # (64, 64, 16) one-hot encoded frame
+    state: npt.NDArray[np.int64]  # (64, 64) frame
     # Ravel indices of changed pixels from the previous frame, used for weighting loss.
     diff_ravel_pixel_indices: npt.NDArray[np.uint16] | None
 
@@ -166,7 +191,7 @@ class RandomVAE(Agent):
 
         # need a way to track wheter a new level has started
         self.levels_completed_prev = 0
-        self.prev_frame: npt.NDArray[np.bool_] | None = None
+        self.prev_frame: npt.NDArray[np.int64] | None = None
 
         self.logger.info(f"Action agent initialized for game_id: {self.game_id}")
 
@@ -254,25 +279,22 @@ class RandomVAE(Agent):
         
         for ft in frame_tensors:
             ft_hash = self._compute_experience_hash(ft)
-            current_frame_np = np.asarray(ft).astype(bool)
 
             if ft_hash not in self.experience_hashes:
 
                 diff_pixels = None
                 if self.prev_frame is not None:
-                    diff_pixels = np.flatnonzero(
-                        np.any(current_frame_np != self.prev_frame, axis=-1)
-                    ).astype(np.uint16)
+                    diff_pixels = np.flatnonzero(ft != self.prev_frame).astype(np.uint16)
 
                 experience = Experience(
-                    state=current_frame_np,  # Already numpy bool
+                    state=ft,  # Already numpy bool
                     diff_ravel_pixel_indices=diff_pixels
                 )
                 self.experience_buffer.append(experience)
                 self.experience_hashes.add(ft_hash)
 
 
-            self.prev_frame = current_frame_np
+            self.prev_frame = ft
 
 
         if self.action_counter % self.train_frequency == 0:
@@ -292,8 +314,8 @@ class RandomVAE(Agent):
         
 
         # Prepare batch data - convert numpy arrays to tensors and move to GPU
-        states_np = np.stack([exp.state for exp in batch]).astype(np.float32)
-        weights_np = np.ones(states_np.shape[:-1], dtype=np.float32)
+        states_np = np.stack([exp.state for exp in batch])
+        weights_np = np.ones(states_np.shape, dtype=np.float32)
         diff_counts = np.array(
             [
                 len(exp.diff_ravel_pixel_indices)
@@ -326,12 +348,12 @@ class RandomVAE(Agent):
     
     def _compute_experience_hash(self, frame: np.array) -> str:
         """Compute hash for frame to ensure uniqueness."""
-        assert frame.shape == (self.grid_size, self.grid_size, self.num_colours)
+        assert frame.shape == (self.grid_size, self.grid_size)
         frame_bytes = frame.tobytes()
         return hashlib.md5(frame_bytes).hexdigest()
 
 
-    def _frame_to_tensor(self, frame_data: FrameData) -> list[npt.NDArray[np.float32]]:
+    def _frame_to_tensor(self, frame_data: FrameData) -> list[npt.NDArray[np.int64]]:
         """
         Convert frame data to tensor format for the model.
         
@@ -343,9 +365,9 @@ class RandomVAE(Agent):
         assert (frame.shape[-2], frame.shape[-1]) == (self.grid_size, self.grid_size)
         
         # One-hot encode: (64, 64) -> (64, 64, 16)
-        tensor = np.eye(self.num_colours, dtype=np.float32)[frame]
+        # tensor = np.eye(self.num_colours, dtype=np.float32)[frame]
         # return [t for t in tensor]
-        return [tensor[-1]]
+        return [frame[-1]]
     
 
     def _loss_fn(
