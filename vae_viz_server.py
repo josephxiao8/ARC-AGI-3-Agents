@@ -140,8 +140,7 @@ class VAEVisualizer:
         if frame.shape != (64, 64):
             raise ValueError(f"Expected a 64x64 grid, got {frame.shape}.")
 
-        tensor = np.eye(vae.input_channels, dtype=np.float32)[frame]
-        mu, _ = vae.encoder(mx.array(tensor[None, :, :, :]))
+        mu, _ = vae.encoder(mx.array(frame[None, :, :]))
         return np.asarray(mu)[0].astype(np.float32).tolist()
 
 
