@@ -103,9 +103,10 @@ class ConvVAE(nn.Module):
         return reconstruction, mu, log_var
     
 
-def vae_loss(reconstruction, x, mu, log_var, beta=10.0):
+def vae_loss(reconstruction, x, mu, log_var, weights, beta=10.0):
     # cross-entropy reconstruction loss
-    recon_loss_per_example = mx.sum(nn.losses.cross_entropy(reconstruction, x), axis=(1, 2))
+    reconstruction_loss = nn.losses.cross_entropy(reconstruction, x) * weights
+    recon_loss_per_example = mx.sum(reconstruction_loss, axis=(1, 2))
     # KL divergence
     kl_loss_per_example = -0.5 * mx.sum(
         1 + log_var - mx.square(mu) - mx.exp(log_var), 
@@ -122,11 +123,14 @@ def vae_loss(reconstruction, x, mu, log_var, beta=10.0):
 @dataclass
 class Experience:
     state: npt.NDArray[np.bool_]  # (64, 64, 16) one-hot encoded frame
+    # Ravel indices of changed pixels from the previous frame, used for weighting loss.
+    diff_ravel_pixel_indices: npt.NDArray[np.uint16] | None
+
 
 class RandomVAE(Agent):
     """An agent that always selects actions at random."""
 
-    MAX_ACTIONS = 5_000
+    MAX_ACTIONS = 10_000
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -162,13 +166,14 @@ class RandomVAE(Agent):
 
         # need a way to track wheter a new level has started
         self.levels_completed_prev = 0
+        self.prev_frame: npt.NDArray[np.bool_] | None = None
 
         self.logger.info(f"Action agent initialized for game_id: {self.game_id}")
 
 
     def _reset_vae_model(self) -> None:
         self.vae = ConvVAE(input_channels=self.num_colours, output_channels=self.num_colours, latent_dim=16)
-        self.optimizer = optim.Adam(learning_rate=0.001)
+        self.optimizer = optim.AdamW(learning_rate=0.0001)
         self.loss_and_grad_fn = nn.value_and_grad(self.vae, self._loss_fn)
 
 
@@ -205,6 +210,9 @@ class RandomVAE(Agent):
             self._save_model(id=f"level_{self.levels_completed_prev}")  # Save model on level up
 
             # don't reset the model on level up, we want to carry forward past experience to next level
+            self.experience_buffer.clear()
+            self.experience_hashes.clear()
+            self.prev_frame = None
 
         if latest_frame.state in [GameState.NOT_PLAYED, GameState.GAME_OVER]:
             # if game is not started (at init or after GAME_OVER) we need to reset
@@ -239,20 +247,33 @@ class RandomVAE(Agent):
             
             action = random.choice(self.action_list[:5])  # Random ACTION1-ACTION5
             action.reasoning = f"Skipped weird frame, random {action.value}"
+
+            self.prev_frame = None  # Reset previous frame tracking on failure
+
             return action
         
         for ft in frame_tensors:
             ft_hash = self._compute_experience_hash(ft)
-
-            if ft_hash in self.experience_hashes:
-                continue  # Skip duplicate frames
-
             current_frame_np = np.asarray(ft).astype(bool)
-            experience = Experience(
-                state=current_frame_np,  # Already numpy bool
-            )
-            self.experience_buffer.append(experience)
-            self.experience_hashes.add(ft_hash)
+
+            if ft_hash not in self.experience_hashes:
+
+                diff_pixels = None
+                if self.prev_frame is not None:
+                    diff_pixels = np.flatnonzero(
+                        np.any(current_frame_np != self.prev_frame, axis=-1)
+                    ).astype(np.uint16)
+
+                experience = Experience(
+                    state=current_frame_np,  # Already numpy bool
+                    diff_ravel_pixel_indices=diff_pixels
+                )
+                self.experience_buffer.append(experience)
+                self.experience_hashes.add(ft_hash)
+
+
+            self.prev_frame = current_frame_np
+
 
         if self.action_counter % self.train_frequency == 0:
             self.vae.train()
@@ -271,9 +292,34 @@ class RandomVAE(Agent):
         
 
         # Prepare batch data - convert numpy arrays to tensors and move to GPU
-        states = mx.array(np.stack([exp.state for exp in batch]).astype(np.float32))
+        states_np = np.stack([exp.state for exp in batch]).astype(np.float32)
+        weights_np = np.ones(states_np.shape[:-1], dtype=np.float32)
+        diff_counts = np.array(
+            [
+                len(exp.diff_ravel_pixel_indices)
+                if exp.diff_ravel_pixel_indices is not None
+                else 0
+                for exp in batch
+            ],
+            dtype=np.intp,
+        )
+        if np.any(diff_counts):
+            batch_idx = np.repeat(np.arange(len(batch), dtype=np.intp), diff_counts)
+            pixel_idx = np.concatenate(
+                [
+                    exp.diff_ravel_pixel_indices
+                    for exp in batch
+                    if exp.diff_ravel_pixel_indices is not None
+                    and len(exp.diff_ravel_pixel_indices) > 0
+                ]
+            ).astype(np.intp, copy=False)
+            flat_weights = weights_np.reshape(len(batch), -1)
+            flat_weights[batch_idx, pixel_idx] = 64.0
 
-        _, grads = self.loss_and_grad_fn(states)
+        states = mx.array(states_np)
+        weights = mx.array(weights_np)
+
+        _, grads = self.loss_and_grad_fn(states, weights)
         self.optimizer.update(self.vae, grads)
         mx.eval(self.vae.parameters(), self.optimizer.state)
 
@@ -298,15 +344,23 @@ class RandomVAE(Agent):
         
         # One-hot encode: (64, 64) -> (64, 64, 16)
         tensor = np.eye(self.num_colours, dtype=np.float32)[frame]
-        return [t for t in tensor]
+        # return [t for t in tensor]
+        return [tensor[-1]]
     
 
     def _loss_fn(
         self,
         states: mx.array,
+        weights: mx.array
     ) -> mx.array:
         reconstruction, mu, log_var = self.vae(states)
-        total_loss, recon_loss, kl_loss = vae_loss(reconstruction, states, mu, log_var)
+        total_loss, recon_loss, kl_loss = vae_loss(
+            reconstruction,
+            states,
+            mu,
+            log_var,
+            weights,
+        )
         variance = mx.exp(log_var)
 
         self.writer.add_scalar('VAE/total_loss', total_loss.item(), self.action_counter)
