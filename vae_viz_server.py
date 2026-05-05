@@ -66,7 +66,7 @@ def load_recording_frames(recording_path: Path) -> list[RecordingFrame]:
                 continue
             grid = frame[-1]
             if len(grid) != 64 or len(grid[0]) != 64:
-                continue
+                raise ValueError(f"Expected a 64x64 grid, got {len(grid)}x{len(grid[0])} in recording {recording_path} at frame index {len(frames)}.")
             frames.append(
                 RecordingFrame(
                     index=len(frames),
