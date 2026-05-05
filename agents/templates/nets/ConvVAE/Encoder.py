@@ -3,8 +3,11 @@ import mlx.core as mx
 from typing import Tuple
 
 class Encoder(nn.Module):
-    def __init__(self, latent_dim: int, input_channels):
+    def __init__(self, latent_dim: int, input_channels: int):
         super().__init__()
+        self.latent_dim = latent_dim
+        self.input_channels = input_channels
+
         self.embedding = nn.Embedding(input_channels, input_channels)
         # 64x64xinput_channels -> 31x31x32
         self.conv1 = nn.Conv2d(input_channels, 32, kernel_size=4, stride=2, padding=0)
