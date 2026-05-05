@@ -8,13 +8,12 @@ class ConvVAE(nn.Module):
     """
     https://arxiv.org/pdf/1803.10122
     """
-    def __init__(self, input_channels, output_channels, latent_dim):
+    def __init__(self, input_channels: int, latent_dim: int):
         super().__init__()
         self.input_channels = input_channels
-        self.output_channels = output_channels
         self.latent_dim = latent_dim
         self.encoder = Encoder(latent_dim, input_channels)
-        self.decoder = Decoder(latent_dim, output_channels, shared_embedding=self.encoder.embedding)
+        self.decoder = Decoder(latent_dim, input_channels, shared_embedding=self.encoder.embedding)
 
     def reparameterize(self, mu: mx.array, log_var: mx.array) -> mx.array:
         std = mx.exp(0.5 * log_var)

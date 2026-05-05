@@ -12,7 +12,7 @@ from flask import Flask, jsonify, render_template_string, request, send_file
 import mlx.core as mx
 import numpy as np
 
-from agents.templates.random_vae_agent import ConvVAE
+from agents.templates.nets import ConvVAE
 from agents.recorder import RECORDING_SUFFIX
 from view_utils import create_grid_image
 
@@ -84,7 +84,6 @@ class VAEVisualizer:
         self.weights_path = weights_path
         self.latent_dim = int(config["latent_dim"])
         self.input_channels = int(config["input_channels"])
-        self.output_channels = int(config["output_channels"])
         self.vae: ConvVAE | None = None
         self._load_lock = Lock()
 
@@ -94,7 +93,6 @@ class VAEVisualizer:
                 if self.vae is None:
                     vae = ConvVAE(
                         input_channels=self.input_channels,
-                        output_channels=self.output_channels,
                         latent_dim=self.latent_dim,
                     )
                     vae.load_weights(str(self.weights_path))
