@@ -32,6 +32,7 @@ class Experience:
     state: npt.NDArray[np.int64]  # (64, 64) frame
     prev_state: npt.NDArray[np.int64] | None  # (64, 64) previous frame, optional
     # Ravel indices of changed pixels from the previous frame, used for weighting loss.
+    action: GameAction | None  # Action taken to get to this state, optional
     diff_ravel_pixel_indices: npt.NDArray[np.uint16] | None
 
 
@@ -99,9 +100,10 @@ class NextStatePrediction:
         eps_prev_states = mx.random.normal(mu_prev_states.shape)
         sample_states = mu_states + mx.exp(0.5 * log_var_states) * eps_states
         sample_prev_states = mu_prev_states + mx.exp(0.5 * log_var_prev_states) * eps_prev_states
+        actions = [exp.action for exp in batch]
 
 
-        _, grads = self.loss_and_grad_fn(sample_states, sample_prev_states, time, action_counter)
+        _, grads = self.loss_and_grad_fn(sample_states, sample_prev_states, time, actions, action_counter)
         self.optimizer.update(self.net, grads)
         mx.eval(self.net.parameters(), self.optimizer.state)
 
@@ -117,9 +119,10 @@ class NextStatePrediction:
                 {
                     "latent_dim": self.latent_dim,
                     "time_dim": self.net.time_dim,
+                    "action_dim": self.net.action_dim,
                     "hidden_dim": self.net.hidden_dim,
                     "flow": "affine",
-                    "conditioned_on_action": False,
+                    "conditioned_on_action": True,
                 },
                 f,
                 indent=2,
@@ -139,11 +142,11 @@ class NextStatePrediction:
         self.loss_and_grad_fn = nn.value_and_grad(self.net, self._loss_fn)
 
 
-    def _loss_fn(self, states: mx.array, prev_states: mx.array, time: mx.array, action_counter: int) -> mx.array:
+    def _loss_fn(self, states: mx.array, prev_states: mx.array, time: mx.array, actions: list[GameAction], action_counter: int) -> mx.array:
         # affine flow matching loss
         states_t = prev_states * (1.0 - time) + states * time
 
-        velocity_pred = self.net(states_t, time)
+        velocity_pred = self.net(states_t, time, actions)
         cond_velocity = states - prev_states
 
         loss = nn.losses.mse_loss(velocity_pred, cond_velocity)
@@ -434,7 +437,8 @@ class RandomVAENextState(Agent):
             experience = Experience(
                 state=ft,  # Already numpy bool
                 prev_state=self.prev_frame,
-                diff_ravel_pixel_indices=diff_pixels
+                action=latest_frame.action_input.id,
+                diff_ravel_pixel_indices=diff_pixels,
             )
             self.latent_encoder_decoder.add_experience(experience)
 
