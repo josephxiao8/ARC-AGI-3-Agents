@@ -106,6 +106,7 @@ class NextStateVisualizer:
                     net = MLP(
                         input_dim=int(config.get("latent_dim", self.latent_dim)),
                         time_dim=int(config.get("time_dim", 1)),
+                        action_dim=int(config.get("action_dim", 16)),
                         hidden_dim=int(config.get("hidden_dim", 128)),
                     )
                     net.load_weights(str(self.next_weights_path))
@@ -151,9 +152,11 @@ class NextStateVisualizer:
 
         return np.argmax(decoded_np, axis=-1).astype(np.int64)
 
-    def predict_next_grid(self, grid: list[list[int]], mode: str, steps: int) -> np.ndarray:
+    def predict_next_latent(self, latent: np.ndarray, action: GameAction, steps: int) -> np.ndarray:
         net = self._get_next_net()
-        latent = self.encode_grid(grid)
+        if latent.shape != (self.latent_dim,):
+            raise ValueError(f"Expected latent shape {(self.latent_dim,)}, got {latent.shape}.")
+
         z_t = mx.array(latent[None, :])
         step_count = max(1, int(steps))
         dt = 1.0 / step_count
@@ -161,10 +164,15 @@ class NextStateVisualizer:
         # simple forward Euler integration for the latent velocity model
         for step in range(step_count):
             time = mx.array([[step / step_count]], dtype=mx.float32)
-            velocity = net(z_t, time)
+            velocity = net(z_t, time, [action])  # using the provided action
             z_t = z_t + velocity * dt
 
-        return self.decode_latent(np.asarray(z_t)[0].astype(np.float32), mode=mode)
+        return np.asarray(z_t)[0].astype(np.float32)
+
+    def predict_next_grid(self, grid: list[list[int]], action: GameAction, mode: str, steps: int) -> np.ndarray:
+        latent = self.encode_grid(grid)
+        predicted_latent = self.predict_next_latent(latent, action=action, steps=steps)
+        return self.decode_latent(predicted_latent, mode=mode)
 
 
 def state_label(state: Any) -> str:
@@ -201,6 +209,67 @@ def grid_to_data_url(grid: np.ndarray | None) -> str | None:
     image.save(buffer, format="PNG")
     encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
     return f"data:image/png;base64,{encoded}"
+
+
+def empty_latent_diff(status: str) -> dict[str, Any]:
+    return {
+        "available": False,
+        "status": status,
+        "latent_dim": 0,
+        "rows": [],
+        "metrics": {},
+    }
+
+
+def latent_diff_row(label: str, values: np.ndarray) -> dict[str, Any]:
+    return {
+        "label": label,
+        "values": [float(value) for value in values.astype(np.float32).tolist()],
+    }
+
+
+def max_abs(values: np.ndarray) -> float:
+    if values.size == 0:
+        return 0.0
+    return float(np.max(np.abs(values)))
+
+
+def latent_diff_payload(
+    before_latent: np.ndarray,
+    actual_latent: np.ndarray,
+    predicted_latent: np.ndarray | None,
+    source_step_count: int,
+    target_step_count: int,
+) -> dict[str, Any]:
+    actual_delta = actual_latent - before_latent
+    rows = [latent_diff_row("Actual dZ", actual_delta)]
+    metrics: dict[str, float] = {
+        "max_abs_actual_delta": max_abs(actual_delta),
+    }
+    status = f"Latent deltas for step {target_step_count} from step {source_step_count}."
+
+    if predicted_latent is not None:
+        predicted_delta = predicted_latent - before_latent
+        error_delta = predicted_delta - actual_delta
+        rows.append(latent_diff_row("Predicted dZ", predicted_delta))
+        rows.append(latent_diff_row("Error dZ", error_delta))
+        metrics.update(
+            {
+                "max_abs_predicted_delta": max_abs(predicted_delta),
+                "max_abs_delta_error": max_abs(error_delta),
+                "l2_delta_error": float(np.linalg.norm(error_delta)),
+            }
+        )
+    else:
+        status = f"Actual latent delta for step {target_step_count} from step {source_step_count}."
+
+    return {
+        "available": True,
+        "status": status,
+        "latent_dim": int(before_latent.shape[0]),
+        "rows": rows,
+        "metrics": metrics,
+    }
 
 
 def action_input_dict(frame_data: FrameDataRaw | None) -> dict[str, Any] | None:
@@ -334,35 +403,51 @@ class GameController:
                     "x": int(action_data["x"]),
                     "y": int(action_data["y"]),
                 }
+                action.set_data(action_data)
 
             before_frame = self.current_frame
             before_grid = frame_to_grid(before_frame)
+            before_latent: np.ndarray | None = None
+            predicted_latent: np.ndarray | None = None
+            source_step_count = self.step_count
+            target_step_count = source_step_count + 1
             prediction = {
                 "available": False,
                 "image": None,
                 "status": "No next-state model selected.",
             }
 
-            if prediction_model is not None and prediction_model.has_next_state_model and before_grid is not None:
+            if prediction_model is not None and before_grid is not None:
                 try:
-                    predicted_grid = prediction_model.predict_next_grid(
-                        before_grid.tolist(),
-                        mode=decode_mode,
-                        steps=flow_steps,
-                    )
-                    prediction = {
-                        "available": True,
-                        "image": grid_to_data_url(predicted_grid),
-                        "status": "Predicted.",
-                    }
+                    before_latent = prediction_model.encode_grid(before_grid.tolist())
                 except Exception as exc:
                     prediction = {
                         "available": False,
                         "image": None,
-                        "status": f"Prediction failed: {exc}",
+                        "status": f"Prediction failed while encoding before frame: {exc}",
                     }
-            elif prediction_model is not None and not prediction_model.has_next_state_model:
-                prediction["status"] = "Selected run has no saved next-state weights."
+
+                if before_latent is not None and prediction_model.has_next_state_model:
+                    try:
+                        predicted_latent = prediction_model.predict_next_latent(
+                            before_latent,
+                            action=action,
+                            steps=flow_steps,
+                        )
+                        predicted_grid = prediction_model.decode_latent(predicted_latent, mode=decode_mode)
+                        prediction = {
+                            "available": True,
+                            "image": grid_to_data_url(predicted_grid),
+                            "status": "Predicted.",
+                        }
+                    except Exception as exc:
+                        prediction = {
+                            "available": False,
+                            "image": None,
+                            "status": f"Prediction failed: {exc}",
+                        }
+                elif not prediction_model.has_next_state_model:
+                    prediction["status"] = "Selected run has no saved next-state weights."
 
             next_frame = self.env.step(
                 action,
@@ -374,11 +459,31 @@ class GameController:
 
             self.current_frame = next_frame
             self.step_count += 1
+            current_grid = frame_to_grid(self.current_frame)
+            latent_diff = empty_latent_diff("No model selected.")
+            if prediction_model is not None:
+                if before_latent is None:
+                    latent_diff = empty_latent_diff("Latent diff unavailable: before frame was not encoded.")
+                elif current_grid is None:
+                    latent_diff = empty_latent_diff("Latent diff unavailable: current frame is missing.")
+                else:
+                    try:
+                        actual_latent = prediction_model.encode_grid(current_grid.tolist())
+                        latent_diff = latent_diff_payload(
+                            before_latent=before_latent,
+                            actual_latent=actual_latent,
+                            predicted_latent=predicted_latent,
+                            source_step_count=source_step_count,
+                            target_step_count=target_step_count,
+                        )
+                    except Exception as exc:
+                        latent_diff = empty_latent_diff(f"Latent diff failed: {exc}")
 
             return {
                 "before": snapshot_from_frame(before_frame, self.step_count - 1, self.current_game_id).__dict__,
                 "current": snapshot_from_frame(self.current_frame, self.step_count, self.current_game_id).__dict__,
                 "prediction": prediction,
+                "latent_diff": latent_diff,
                 "action": {
                     "id": action_id,
                     "label": action_label(action_id, action_data),
@@ -544,6 +649,54 @@ HTML_TEMPLATE = """
         min-width: 0;
       }
 
+      .latent-diff {
+        margin-top: 24px;
+        padding-top: 16px;
+        border-top: 1px solid #ddddda;
+      }
+
+      .latent-diff h2 {
+        margin-bottom: 10px;
+      }
+
+      .latent-diff-summary {
+        margin-bottom: 10px;
+        font-size: 12px;
+        color: #555;
+      }
+
+      .latent-diff-grid {
+        display: grid;
+        gap: 6px;
+        overflow-x: auto;
+      }
+
+      .latent-diff-row {
+        display: grid;
+        gap: 6px;
+      }
+
+      .latent-diff-cell {
+        min-width: 52px;
+        padding: 6px 4px;
+        border: 1px solid #d7d7d2;
+        background: #fff;
+        font-size: 11px;
+        font-variant-numeric: tabular-nums;
+        text-align: center;
+      }
+
+      .latent-diff-label {
+        min-width: 96px;
+        text-align: left;
+        font-weight: 600;
+      }
+
+      .latent-diff-header .latent-diff-cell {
+        background: #ececea;
+        font-weight: 600;
+      }
+
       img {
         display: block;
         width: 100%;
@@ -675,6 +828,12 @@ HTML_TEMPLATE = """
             <div id="prediction-status" class="status-text"></div>
           </div>
         </div>
+
+        <section class="latent-diff">
+          <h2>Latent Delta</h2>
+          <div id="latent-diff-summary" class="latent-diff-summary">No latent diff yet.</div>
+          <div id="latent-diff-grid" class="latent-diff-grid" hidden></div>
+        </section>
       </section>
     </div>
 
@@ -702,6 +861,8 @@ HTML_TEMPLATE = """
       const currentImage = document.getElementById("current-image");
       const predictionImage = document.getElementById("prediction-image");
       const predictionStatus = document.getElementById("prediction-status");
+      const latentDiffSummary = document.getElementById("latent-diff-summary");
+      const latentDiffGrid = document.getElementById("latent-diff-grid");
       const toast = document.getElementById("toast");
       const modeInputs = [...document.querySelectorAll('input[name="decode-mode"]')];
 
@@ -803,6 +964,88 @@ HTML_TEMPLATE = """
         }
       }
 
+      function formatDelta(value) {
+        if (!Number.isFinite(value)) {
+          return "-";
+        }
+        return `${value >= 0 ? "+" : ""}${value.toFixed(2)}`;
+      }
+
+      function formatMetric(value) {
+        if (!Number.isFinite(value)) {
+          return "-";
+        }
+        return value.toFixed(4);
+      }
+
+      function renderLatentDiff(diff) {
+        latentDiffGrid.hidden = true;
+        latentDiffGrid.replaceChildren();
+
+        if (!diff || !diff.available || !diff.rows?.length) {
+          latentDiffSummary.textContent = diff?.status || "No latent diff yet.";
+          return;
+        }
+
+        const metrics = diff.metrics || {};
+        const metricParts = [];
+        if (Number.isFinite(metrics.max_abs_actual_delta)) {
+          metricParts.push(`actual max ${formatMetric(metrics.max_abs_actual_delta)}`);
+        }
+        if (Number.isFinite(metrics.max_abs_predicted_delta)) {
+          metricParts.push(`pred max ${formatMetric(metrics.max_abs_predicted_delta)}`);
+        }
+        if (Number.isFinite(metrics.max_abs_delta_error)) {
+          metricParts.push(`error max ${formatMetric(metrics.max_abs_delta_error)}`);
+        }
+        if (Number.isFinite(metrics.l2_delta_error)) {
+          metricParts.push(`error l2 ${formatMetric(metrics.l2_delta_error)}`);
+        }
+
+        latentDiffSummary.textContent = [diff.status, metricParts.join(" | ")]
+          .filter(Boolean)
+          .join(" ");
+        latentDiffGrid.hidden = false;
+
+        const columns = `minmax(96px, 0.8fr) repeat(${diff.latent_dim}, minmax(52px, 1fr))`;
+        const headerRow = document.createElement("div");
+        headerRow.className = "latent-diff-row latent-diff-header";
+        headerRow.style.gridTemplateColumns = columns;
+
+        const labelHeader = document.createElement("div");
+        labelHeader.className = "latent-diff-cell latent-diff-label";
+        labelHeader.textContent = "";
+        headerRow.appendChild(labelHeader);
+
+        for (let i = 0; i < diff.latent_dim; i += 1) {
+          const cell = document.createElement("div");
+          cell.className = "latent-diff-cell";
+          cell.textContent = `z${i}`;
+          headerRow.appendChild(cell);
+        }
+        latentDiffGrid.appendChild(headerRow);
+
+        for (const row of diff.rows) {
+          const rowElement = document.createElement("div");
+          rowElement.className = "latent-diff-row";
+          rowElement.style.gridTemplateColumns = columns;
+
+          const labelCell = document.createElement("div");
+          labelCell.className = "latent-diff-cell latent-diff-label";
+          labelCell.textContent = row.label;
+          rowElement.appendChild(labelCell);
+
+          for (const value of row.values) {
+            const cell = document.createElement("div");
+            cell.className = "latent-diff-cell";
+            cell.textContent = formatDelta(Number(value));
+            rowElement.appendChild(cell);
+          }
+
+          latentDiffGrid.appendChild(rowElement);
+        }
+      }
+
       function renderSnapshot(snapshot, actionLabel = "-") {
         currentSnapshot = snapshot;
         stateValue.textContent = snapshot.state;
@@ -822,6 +1065,7 @@ HTML_TEMPLATE = """
         predictionStatus.textContent = "";
         setImage(currentImage, null);
         setImage(predictionImage, null);
+        renderLatentDiff(null);
         updateActionButtons();
       }
 
@@ -847,6 +1091,7 @@ HTML_TEMPLATE = """
           renderSnapshot(payload.current, "RESET");
           predictionStatus.textContent = "";
           setImage(predictionImage, null);
+          renderLatentDiff(null);
         } catch (error) {
           showToast(error instanceof Error ? error.message : "Failed to start game.");
         }
@@ -858,6 +1103,7 @@ HTML_TEMPLATE = """
           renderSnapshot(payload.current, "RESET");
           predictionStatus.textContent = "";
           setImage(predictionImage, null);
+          renderLatentDiff(null);
         } catch (error) {
           showToast(error instanceof Error ? error.message : "Failed to reset game.");
         }
@@ -885,6 +1131,7 @@ HTML_TEMPLATE = """
           renderSnapshot(payload.current, payload.action.label);
           setImage(predictionImage, payload.prediction.image);
           predictionStatus.textContent = payload.prediction.status;
+          renderLatentDiff(payload.latent_diff);
           if (payload.current.state === "WIN") {
             showToast("Game won.");
           } else if (payload.current.state === "GAME_OVER") {
@@ -928,7 +1175,10 @@ HTML_TEMPLATE = """
       startButton.addEventListener("click", startGame);
       resetButton.addEventListener("click", resetGame);
       gameSelect.addEventListener("change", clearGameState);
-      modelSelect.addEventListener("change", updateModelStatus);
+      modelSelect.addEventListener("change", () => {
+        updateModelStatus();
+        renderLatentDiff(null);
+      });
       stepSlider.addEventListener("input", () => {
         stepValue.textContent = stepSlider.value;
       });
