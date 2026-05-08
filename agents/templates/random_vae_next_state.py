@@ -96,14 +96,12 @@ class NextStatePrediction:
         mu_states, log_var_states = self.encoder(states)
         mu_prev_states, log_var_prev_states = self.encoder(prev_states)
         
-        eps_states = mx.random.normal(mu_states.shape)
         eps_prev_states = mx.random.normal(mu_prev_states.shape)
-        sample_states = mu_states + mx.exp(0.5 * log_var_states) * eps_states
         sample_prev_states = mu_prev_states + mx.exp(0.5 * log_var_prev_states) * eps_prev_states
         actions = [exp.action for exp in batch]
 
 
-        _, grads = self.loss_and_grad_fn(sample_states, sample_prev_states, time, actions, action_counter)
+        _, grads = self.loss_and_grad_fn(mu_states, sample_prev_states, time, actions, action_counter)
         self.optimizer.update(self.net, grads)
         mx.eval(self.net.parameters(), self.optimizer.state)
 
