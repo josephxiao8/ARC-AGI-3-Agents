@@ -27,15 +27,20 @@ class MLP(nn.Module):
         self.action_dim = action_dim
         self.hidden_dim = hidden_dim
 
+
         self.main = nn.Sequential(
             nn.Linear(input_dim + time_dim + action_dim, hidden_dim),
             Swish(),
+            nn.RMSNorm(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim),
             Swish(),
+            nn.RMSNorm(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim),
             Swish(),
+            nn.RMSNorm(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim),
             Swish(),
+            nn.RMSNorm(hidden_dim),
             nn.Linear(hidden_dim, input_dim),
         )
 
