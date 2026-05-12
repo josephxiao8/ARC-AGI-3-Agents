@@ -9,6 +9,7 @@ from .templates.random_agent import Random
 from .templates.stochastic_goose_agent import StochasticGooseAgent
 from .templates.random_vae_agent import RandomVAE
 from .templates.random_vae_next_state import RandomVAENextState
+from .templates.random_layered_next_state import RandomLayeredNextState
 
 load_dotenv()
 
