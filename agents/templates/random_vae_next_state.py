@@ -25,7 +25,7 @@ from tensorboardX import SummaryWriter
 import hashlib
 
 from .nets import ConvVAE, MLP
-
+from agents.templates.nets.ConvVAE import Encoder
 
 @dataclass
 class Experience:
@@ -38,7 +38,7 @@ class Experience:
 
 
 class NextStatePrediction:
-    def __init__(self, encoder: ConvVAE, base_dir: str, writer: SummaryWriter):
+    def __init__(self, encoder: Encoder, base_dir: str, writer: SummaryWriter):
         self.encoder = encoder
         self.latent_dim = encoder.latent_dim
 
