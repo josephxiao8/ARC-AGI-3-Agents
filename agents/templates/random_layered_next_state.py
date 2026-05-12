@@ -125,7 +125,7 @@ class NextStatePrediction:
         prev_frames: mx.array,
         actions: list[GameAction],
         action_counter: int,
-        beta: float = 1.0,
+        beta: float = 0.1,
     ) -> mx.array:
         static_layer_logits, dynamic_layer_logits, next_dynamic_layer_logits = self.net(
             prev_frames,
@@ -190,37 +190,37 @@ class NextStatePrediction:
         total_loss = total_prev_frame_loss + total_next_frame_loss
 
         self.writer.add_scalar(
-            'NextStatePrediction/prev_reconstruction_loss',
+            'Prev/reconstruction_loss',
             prev_reconstruction_loss.item(),
             action_counter,
         )
         self.writer.add_scalar(
-            'NextStatePrediction/prev_blank_loss',
+            'Prev/blank_loss',
             prev_blank_loss.item(),
             action_counter,
         )
         self.writer.add_scalar(
-            'NextStatePrediction/total_prev_frame_loss',
+            'Prev/total_loss',
             total_prev_frame_loss.item(),
             action_counter,
         )
         self.writer.add_scalar(
-            'NextStatePrediction/next_frame_loss',
+            'Next/reconstruction_loss',
             next_frame_loss.item(),
             action_counter,
         )
         self.writer.add_scalar(
-            'NextStatePrediction/next_blank_loss',
+            'Next/blank_loss',
             next_blank_loss.item(),
             action_counter,
         )
         self.writer.add_scalar(
-            'NextStatePrediction/total_next_frame_loss',
+            'Next/total_loss',
             total_next_frame_loss.item(),
             action_counter,
         )
         self.writer.add_scalar(
-            'NextStatePrediction/total_loss',
+            'Combined/total_loss',
             total_loss.item(),
             action_counter,
         )
@@ -230,7 +230,7 @@ class NextStatePrediction:
 class RandomLayeredNextState(Agent):
     """An agent that always selects actions at random."""
 
-    MAX_ACTIONS = 10_000
+    MAX_ACTIONS = 5_000
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)

@@ -94,7 +94,7 @@ class Layered(nn.Module):
         )
 
         self.dynamic_layer = nn.Sequential(
-            nn.Conv2d(256, 64, kernel_size=3, padding=1),
+            nn.Conv2d(256 + 16, 64, kernel_size=3, padding=1),
             nn.ReLU(),
             nn.RMSNorm(64),    
             nn.Conv2d(64, 16, kernel_size=3, padding=1),
@@ -121,7 +121,7 @@ class Layered(nn.Module):
         features = self.backbone(x_0)  # shape: (batch_size, height, width, 256)
 
         static_layer_features = self.static_layer(features)  # shape: (batch_size, height, width, 16)
-        dynamic_layer_features = self.dynamic_layer(features)  # shape: (batch_size, height, width, 16)
+        dynamic_layer_features = self.dynamic_layer(mx.concatenate([features, static_layer_features], axis=-1))  # shape: (batch_size, height, width, 16)
         
         
         static_layer_logits = self.token_embedding.as_linear(static_layer_features)  # shape: (batch_size, height, width, vocab_size)
