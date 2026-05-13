@@ -9,11 +9,11 @@ from pathlib import Path
 from threading import Lock
 from typing import Any
 
-from arcengine import FrameDataRaw, GameAction
-from flask import Flask, jsonify, render_template_string, request
 import arc_agi
 import mlx.core as mx
 import numpy as np
+from arcengine import FrameDataRaw, GameAction
+from flask import Flask, jsonify, render_template_string, request
 from PIL import Image, ImageDraw
 
 from agents.recorder import RECORDING_SUFFIX
@@ -233,7 +233,7 @@ def create_layer_image(
     grid: np.ndarray,
     cell_size: int = 8,
     border_width: int = 1,
-    blank_token_id: int | None = None,
+    static_gate_token_id: int | None = None,
 ) -> Image.Image:
     grid = np.asarray(grid, dtype=np.int64)
     height, width = grid.shape
@@ -251,12 +251,49 @@ def create_layer_image(
             right = left + cell_size
             bottom = top + cell_size
 
-            if blank_token_id is not None and token == blank_token_id:
+            if static_gate_token_id is not None and token == static_gate_token_id:
                 draw.rectangle([left, top, right, bottom], fill=(242, 242, 238))
                 draw.line([left, bottom, right, top], fill=(206, 206, 198))
             else:
                 color = hex_to_rgb(key_colors.get(token, "#FFFFFF"))
                 draw.rectangle([left, top, right, bottom], fill=color)
+
+    return image
+
+
+def create_gate_image(
+    gate: np.ndarray,
+    cell_size: int = 8,
+    border_width: int = 1,
+) -> Image.Image:
+    gate = np.asarray(gate, dtype=np.float32).squeeze()
+    if gate.ndim != 2:
+        raise ValueError(f"Expected a 2D gate array, got {gate.shape}.")
+
+    gate = np.clip(gate, 0.0, 1.0)
+    height, width = gate.shape
+    img_width = width * cell_size + (width + 1) * border_width
+    img_height = height * cell_size + (height + 1) * border_width
+
+    image = Image.new("RGB", (img_width, img_height), "white")
+    draw = ImageDraw.Draw(image)
+
+    dynamic_rgb = np.array((42, 84, 102), dtype=np.float32)
+    static_rgb = np.array((244, 214, 94), dtype=np.float32)
+
+    for y in range(height):
+        for x in range(width):
+            value = gate[y, x]
+            color = tuple(
+                np.round(dynamic_rgb * (1.0 - value) + static_rgb * value)
+                .astype(np.uint8)
+                .tolist()
+            )
+            left = x * (cell_size + border_width) + border_width
+            top = y * (cell_size + border_width) + border_width
+            right = left + cell_size
+            bottom = top + cell_size
+            draw.rectangle([left, top, right, bottom], fill=color)
 
     return image
 
@@ -276,7 +313,7 @@ def grid_to_data_url(grid: np.ndarray | None) -> str | None:
 
 def layer_grid_to_data_url(
     grid: np.ndarray | None,
-    blank_token_id: int | None = None,
+    static_gate_token_id: int | None = None,
 ) -> str | None:
     if grid is None:
         return None
@@ -285,9 +322,20 @@ def layer_grid_to_data_url(
             grid,
             cell_size=8,
             border_width=1,
-            blank_token_id=blank_token_id,
+            static_gate_token_id=static_gate_token_id,
         )
     )
+
+
+def gate_to_data_url(gate: np.ndarray | None) -> str | None:
+    if gate is None:
+        return None
+    return image_to_data_url(create_gate_image(gate, cell_size=8, border_width=1))
+
+
+def sigmoid_np(logits: np.ndarray) -> np.ndarray:
+    logits = np.clip(logits, -80.0, 80.0)
+    return 1.0 / (1.0 + np.exp(-logits))
 
 
 class LayeredVisualizer:
@@ -297,7 +345,7 @@ class LayeredVisualizer:
         self.weights_path = weights_path
         self.vocab_size = int(config.get("vocab_size", 16))
         self.action_dim = int(config.get("action_dim", 16))
-        self.blank_token_id = self.vocab_size
+        self.static_gate_token_id = -1
         self.net: Layered | None = None
         self._load_lock = Lock()
 
@@ -318,20 +366,28 @@ class LayeredVisualizer:
         self,
         grid: list[list[int]] | np.ndarray,
         action: GameAction,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         frame = np.asarray(grid, dtype=np.int64)
         if frame.shape != (64, 64):
             raise ValueError(f"Expected a 64x64 grid, got {frame.shape}.")
 
         net = self._get_net()
-        static_logits, dynamic_logits, next_dynamic_logits = net(
+        (
+            static_logits,
+            dynamic_logits,
+            dynamic_gate_logits,
+            next_dynamic_logits,
+            next_dynamic_gate_logits,
+        ) = net(
             mx.array(frame[None, :, :]),
             [action],
         )
         return (
             np.asarray(static_logits)[0],
             np.asarray(dynamic_logits)[0],
+            np.asarray(dynamic_gate_logits)[0],
             np.asarray(next_dynamic_logits)[0],
+            np.asarray(next_dynamic_gate_logits)[0],
         )
 
     def render_layers(
@@ -344,48 +400,68 @@ class LayeredVisualizer:
             raise ValueError("mode must be 'argmax' or 'sample'.")
 
         frame = np.asarray(grid, dtype=np.int64)
-        static_logits, dynamic_logits, next_dynamic_logits = self.forward(frame, action)
+        (
+            static_logits,
+            dynamic_logits,
+            dynamic_gate_logits,
+            next_dynamic_logits,
+            next_dynamic_gate_logits,
+        ) = self.forward(frame, action)
 
         static_grid = decode_logits(static_logits, mode)
         dynamic_grid = decode_logits(dynamic_logits, mode)
+        dynamic_gate = sigmoid_np(dynamic_gate_logits[..., 0])
+        dynamic_static_mask = dynamic_gate >= 0.5
+        dynamic_display_grid = np.where(
+            dynamic_static_mask,
+            self.static_gate_token_id,
+            dynamic_grid,
+        )
         reconstruction_grid = np.where(
-            dynamic_grid == self.blank_token_id,
+            dynamic_static_mask,
             static_grid,
             dynamic_grid,
         )
 
         next_dynamic_grid = decode_logits(next_dynamic_logits, mode)
+        next_dynamic_gate = sigmoid_np(next_dynamic_gate_logits[..., 0])
+        next_dynamic_static_mask = next_dynamic_gate >= 0.5
+        next_dynamic_display_grid = np.where(
+            next_dynamic_static_mask,
+            self.static_gate_token_id,
+            next_dynamic_grid,
+        )
         next_reconstruction_grid = np.where(
-            next_dynamic_grid == self.blank_token_id,
+            next_dynamic_static_mask,
             static_grid,
             next_dynamic_grid,
         )
 
-        dynamic_blank_prob = softmax_np(dynamic_logits)[..., self.blank_token_id]
-        next_blank_prob = softmax_np(next_dynamic_logits)[..., self.blank_token_id]
         static_confidence = np.max(softmax_np(static_logits), axis=-1)
 
         return {
             "input": grid_to_data_url(frame),
             "static": layer_grid_to_data_url(static_grid),
             "dynamic": layer_grid_to_data_url(
-                dynamic_grid,
-                blank_token_id=self.blank_token_id,
+                dynamic_display_grid,
+                static_gate_token_id=self.static_gate_token_id,
             ),
+            "dynamic_gate": gate_to_data_url(dynamic_gate),
             "reconstruction": grid_to_data_url(reconstruction_grid),
             "next_dynamic": layer_grid_to_data_url(
-                next_dynamic_grid,
-                blank_token_id=self.blank_token_id,
+                next_dynamic_display_grid,
+                static_gate_token_id=self.static_gate_token_id,
             ),
+            "next_dynamic_gate": gate_to_data_url(next_dynamic_gate),
             "next_reconstruction": grid_to_data_url(next_reconstruction_grid),
             "metrics": {
-                "dynamic_blank_prob_mean": float(dynamic_blank_prob.mean()),
-                "dynamic_blank_argmax_fraction": float(
-                    np.mean(dynamic_grid == self.blank_token_id)
+                "dynamic_gate_mean": float(dynamic_gate.mean()),
+                "dynamic_static_gate_fraction": float(
+                    np.mean(dynamic_static_mask)
                 ),
-                "next_blank_prob_mean": float(next_blank_prob.mean()),
-                "next_blank_argmax_fraction": float(
-                    np.mean(next_dynamic_grid == self.blank_token_id)
+                "next_gate_mean": float(next_dynamic_gate.mean()),
+                "next_static_gate_fraction": float(
+                    np.mean(next_dynamic_static_mask)
                 ),
                 "static_confidence_mean": float(static_confidence.mean()),
             },
@@ -885,6 +961,10 @@ HTML_TEMPLATE = """
             <img id="dynamic-image" alt="Dynamic layer">
           </div>
           <div class="preview-panel">
+            <h2>Dynamic Gate</h2>
+            <img id="dynamic-gate-image" alt="Dynamic sigmoid gate">
+          </div>
+          <div class="preview-panel">
             <h2>Reconstruction</h2>
             <img id="reconstruction-image" alt="Layered reconstruction">
           </div>
@@ -901,6 +981,10 @@ HTML_TEMPLATE = """
             <img id="next-dynamic-image" alt="Predicted next dynamic layer">
           </div>
           <div class="preview-panel">
+            <h2>Next Gate</h2>
+            <img id="next-gate-image" alt="Predicted next sigmoid gate">
+          </div>
+          <div class="preview-panel">
             <h2>Live Current</h2>
             <img id="live-current-image" alt="Current live game frame">
           </div>
@@ -912,20 +996,20 @@ HTML_TEMPLATE = """
             <div id="static-confidence-value" class="metric-value">-</div>
           </div>
           <div class="metric">
-            <div class="metric-label">Dyn blank p</div>
-            <div id="dynamic-blank-prob-value" class="metric-value">-</div>
+            <div class="metric-label">Dyn gate</div>
+            <div id="dynamic-gate-value" class="metric-value">-</div>
           </div>
           <div class="metric">
-            <div class="metric-label">Dyn blank %</div>
-            <div id="dynamic-blank-frac-value" class="metric-value">-</div>
+            <div class="metric-label">Dyn static %</div>
+            <div id="dynamic-static-frac-value" class="metric-value">-</div>
           </div>
           <div class="metric">
-            <div class="metric-label">Next blank p</div>
-            <div id="next-blank-prob-value" class="metric-value">-</div>
+            <div class="metric-label">Next gate</div>
+            <div id="next-gate-value" class="metric-value">-</div>
           </div>
           <div class="metric">
-            <div class="metric-label">Next blank %</div>
-            <div id="next-blank-frac-value" class="metric-value">-</div>
+            <div class="metric-label">Next static %</div>
+            <div id="next-static-frac-value" class="metric-value">-</div>
           </div>
         </div>
       </section>
@@ -964,16 +1048,18 @@ HTML_TEMPLATE = """
       const inputImage = document.getElementById("input-image");
       const staticImage = document.getElementById("static-image");
       const dynamicImage = document.getElementById("dynamic-image");
+      const dynamicGateImage = document.getElementById("dynamic-gate-image");
       const reconstructionImage = document.getElementById("reconstruction-image");
       const nextImage = document.getElementById("next-image");
       const actualNextImage = document.getElementById("actual-next-image");
       const nextDynamicImage = document.getElementById("next-dynamic-image");
+      const nextGateImage = document.getElementById("next-gate-image");
       const liveCurrentImage = document.getElementById("live-current-image");
       const staticConfidenceValue = document.getElementById("static-confidence-value");
-      const dynamicBlankProbValue = document.getElementById("dynamic-blank-prob-value");
-      const dynamicBlankFracValue = document.getElementById("dynamic-blank-frac-value");
-      const nextBlankProbValue = document.getElementById("next-blank-prob-value");
-      const nextBlankFracValue = document.getElementById("next-blank-frac-value");
+      const dynamicGateValue = document.getElementById("dynamic-gate-value");
+      const dynamicStaticFracValue = document.getElementById("dynamic-static-frac-value");
+      const nextGateValue = document.getElementById("next-gate-value");
+      const nextStaticFracValue = document.getElementById("next-static-frac-value");
       const toast = document.getElementById("toast");
       const modeInputs = [...document.querySelectorAll('input[name="decode-mode"]')];
       const sourceInputs = [...document.querySelectorAll('input[name="source-mode"]')];
@@ -1037,15 +1123,24 @@ HTML_TEMPLATE = """
       function renderMetrics(metrics) {
         metrics = metrics || {};
         staticConfidenceValue.textContent = formatNumber(metrics.static_confidence_mean);
-        dynamicBlankProbValue.textContent = formatNumber(metrics.dynamic_blank_prob_mean);
-        dynamicBlankFracValue.textContent = formatPercent(metrics.dynamic_blank_argmax_fraction);
-        nextBlankProbValue.textContent = formatNumber(metrics.next_blank_prob_mean);
-        nextBlankFracValue.textContent = formatPercent(metrics.next_blank_argmax_fraction);
+        dynamicGateValue.textContent = formatNumber(metrics.dynamic_gate_mean);
+        dynamicStaticFracValue.textContent = formatPercent(metrics.dynamic_static_gate_fraction);
+        nextGateValue.textContent = formatNumber(metrics.next_gate_mean);
+        nextStaticFracValue.textContent = formatPercent(metrics.next_static_gate_fraction);
       }
 
       function renderLayerImages(layers) {
         if (!layers) {
-          for (const image of [inputImage, staticImage, dynamicImage, reconstructionImage, nextImage, nextDynamicImage]) {
+          for (const image of [
+            inputImage,
+            staticImage,
+            dynamicImage,
+            dynamicGateImage,
+            reconstructionImage,
+            nextImage,
+            nextDynamicImage,
+            nextGateImage,
+          ]) {
             setImage(image, null);
           }
           renderMetrics(null);
@@ -1054,9 +1149,11 @@ HTML_TEMPLATE = """
         setImage(inputImage, layers.input);
         setImage(staticImage, layers.static);
         setImage(dynamicImage, layers.dynamic);
+        setImage(dynamicGateImage, layers.dynamic_gate);
         setImage(reconstructionImage, layers.reconstruction);
         setImage(nextImage, layers.next_reconstruction);
         setImage(nextDynamicImage, layers.next_dynamic);
+        setImage(nextGateImage, layers.next_dynamic_gate);
         renderMetrics(layers.metrics);
       }
 
