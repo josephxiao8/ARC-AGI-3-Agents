@@ -1,31 +1,30 @@
-from collections import deque
-from dataclasses import dataclass
+import hashlib
 import json
 import logging
 import os
 import random
 import time
-from typing import Any, Tuple
-
-from arcengine import FrameData, GameAction, GameState
-
-from utils import get_environment_directory, setup_experiment_directory, setup_logging_for_experiment
-
-from ..agent import Agent
+from collections import deque
+from dataclasses import dataclass
+from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
-
 import numpy as np
 import numpy.typing as npt
-
+from arcengine import FrameData, GameAction, GameState
 from tensorboardX import SummaryWriter
 
-import hashlib
+from utils import (
+    get_environment_directory,
+    setup_experiment_directory,
+    setup_logging_for_experiment,
+)
 
+from ..agent import Agent
 from .nets import Layered
-from agents.templates.nets.ConvVAE import Encoder
+
 
 @dataclass
 class Experience:
@@ -68,7 +67,7 @@ class NextStatePrediction:
 
         self.logger.info("Cleared experience buffer and hashes for NextStatePrediction.")
 
-    def train_batch(self, action_counter: int, batch_size: int = 64) -> None:
+    def train_batch(self, action_counter: int, batch_size: int = 8) -> None:
         if len(self.experience_buffer) < batch_size:
             return
         
@@ -127,7 +126,13 @@ class NextStatePrediction:
         action_counter: int,
         beta: float = 0.1,
     ) -> mx.array:
-        static_layer_logits, dynamic_layer_logits, next_dynamic_layer_logits = self.net(
+        (
+            static_layer_logits,
+            dynamic_layer_logits,
+            dynamic_gate_logits,
+            next_dynamic_layer_logits,
+            next_dynamic_gate_logits,
+        ) = self.net(
             prev_frames,
             actions,
         )
@@ -135,57 +140,59 @@ class NextStatePrediction:
         def reduce_per_pixel_loss(per_pixel_loss: mx.array) -> mx.array:
             """
             Args:
-                per_pixel_loss: shape (batch_size, height, width)
+                per_pixel_loss: shape (batch_size, height, width[, channels])
             """
-            return mx.mean(mx.sum(per_pixel_loss, axis=(1, 2)))
+            loss_axes = tuple(range(1, per_pixel_loss.ndim))
+            return mx.mean(mx.sum(per_pixel_loss, axis=loss_axes))
 
-        blank_token_id = self.net.blank_token_id
-        blank_targets = mx.full(frames.shape, blank_token_id, dtype=frames.dtype)
         unchanged_pixel_mask = frames == prev_frames
+        static_gate_targets = unchanged_pixel_mask[..., None].astype(
+            dynamic_gate_logits.dtype
+        )
 
         # Previous-frame reconstruction. The dynamic layer softly gates whether a
         # pixel is reconstructed by static logits or dynamic logits.
         prev_static_ce = nn.losses.cross_entropy(static_layer_logits, prev_frames)
         prev_dynamic_ce = nn.losses.cross_entropy(dynamic_layer_logits, prev_frames)
-        prev_dynamic_blank_prob = mx.softmax(dynamic_layer_logits, axis=-1)[
-            ..., blank_token_id
-        ]
+        prev_dynamic_ce = mx.where(unchanged_pixel_mask, 0.0, prev_dynamic_ce)
+        prev_static_gate = mx.sigmoid(dynamic_gate_logits[..., 0])
         prev_mixture_ce = (
-            prev_dynamic_blank_prob * prev_static_ce
-            + (1.0 - prev_dynamic_blank_prob) * prev_dynamic_ce
+            prev_static_gate * prev_static_ce
+            + (1.0 - prev_static_gate) * prev_dynamic_ce
         )
 
-        prev_dynamic_blank_ce = nn.losses.cross_entropy(
-            dynamic_layer_logits,
-            blank_targets,
+        prev_gate_ce = nn.losses.binary_cross_entropy(
+            dynamic_gate_logits,
+            static_gate_targets,
+            with_logits=True,
+            reduction="none",
         )
-        prev_dynamic_blank_ce = mx.where(unchanged_pixel_mask, prev_dynamic_blank_ce, 0.0)
 
         prev_reconstruction_loss = reduce_per_pixel_loss(prev_mixture_ce)
-        prev_blank_loss = reduce_per_pixel_loss(prev_dynamic_blank_ce)
-        total_prev_frame_loss = prev_reconstruction_loss + beta * prev_blank_loss
+        prev_gate_loss = reduce_per_pixel_loss(prev_gate_ce)
+        total_prev_frame_loss = prev_reconstruction_loss + beta * prev_gate_loss
 
         # Next-frame prediction. Reuse the previous-frame static layer and let the
         # predicted next dynamic layer decide when to override it.
         next_static_ce = nn.losses.cross_entropy(static_layer_logits, frames)
         next_dynamic_ce = nn.losses.cross_entropy(next_dynamic_layer_logits, frames)
-        next_dynamic_blank_prob = mx.softmax(next_dynamic_layer_logits, axis=-1)[
-            ..., blank_token_id
-        ]
+        next_dynamic_ce = mx.where(unchanged_pixel_mask, 0.0, next_dynamic_ce)
+        next_static_gate = mx.sigmoid(next_dynamic_gate_logits[..., 0])
         next_mixture_ce = (
-            next_dynamic_blank_prob * next_static_ce
-            + (1.0 - next_dynamic_blank_prob) * next_dynamic_ce
+            next_static_gate * next_static_ce
+            + (1.0 - next_static_gate) * next_dynamic_ce
         )
 
-        next_dynamic_blank_ce = nn.losses.cross_entropy(
-            next_dynamic_layer_logits,
-            blank_targets,
+        next_gate_ce = nn.losses.binary_cross_entropy(
+            next_dynamic_gate_logits,
+            static_gate_targets,
+            with_logits=True,
+            reduction="none",
         )
-        next_dynamic_blank_ce = mx.where(unchanged_pixel_mask, next_dynamic_blank_ce, 0.0)
 
         next_frame_loss = reduce_per_pixel_loss(next_mixture_ce)
-        next_blank_loss = reduce_per_pixel_loss(next_dynamic_blank_ce)
-        total_next_frame_loss = next_frame_loss + beta * next_blank_loss
+        next_gate_loss = reduce_per_pixel_loss(next_gate_ce)
+        total_next_frame_loss = next_frame_loss + beta * next_gate_loss
 
         total_loss = total_prev_frame_loss + total_next_frame_loss
 
@@ -195,8 +202,8 @@ class NextStatePrediction:
             action_counter,
         )
         self.writer.add_scalar(
-            'Prev/blank_loss',
-            prev_blank_loss.item(),
+            'Prev/gate_loss',
+            prev_gate_loss.item(),
             action_counter,
         )
         self.writer.add_scalar(
@@ -210,8 +217,8 @@ class NextStatePrediction:
             action_counter,
         )
         self.writer.add_scalar(
-            'Next/blank_loss',
-            next_blank_loss.item(),
+            'Next/gate_loss',
+            next_gate_loss.item(),
             action_counter,
         )
         self.writer.add_scalar(
@@ -230,7 +237,7 @@ class NextStatePrediction:
 class RandomLayeredNextState(Agent):
     """An agent that always selects actions at random."""
 
-    MAX_ACTIONS = 5_000
+    MAX_ACTIONS = 10_000
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
