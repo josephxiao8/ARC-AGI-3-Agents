@@ -232,12 +232,18 @@ class NextStatePrediction:
             action_counter,
         )
 
+        # self.writer.add_histogram(
+        #     'Actions',
+        #     np.array([a.value for a in actions], dtype=np.int64),
+        #     action_counter,
+        # )
+
         return total_loss
 
 class RandomLayeredNextState(Agent):
     """An agent that always selects actions at random."""
 
-    MAX_ACTIONS = 10_000
+    MAX_ACTIONS = 20_000
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -268,6 +274,7 @@ class RandomLayeredNextState(Agent):
         # need a way to track wheter a new level has started
         self.levels_completed_prev = 0
         self.prev_frame: npt.NDArray[np.int64] | None = None
+        self.prev_action: GameAction | None = None
 
         self._reset_models()
 
@@ -316,6 +323,7 @@ class RandomLayeredNextState(Agent):
             self.next_state_predictor.clear_experience()
 
             self.prev_frame = None
+            self.prev_action = None
 
         if latest_frame.state in [GameState.NOT_PLAYED, GameState.GAME_OVER]:
             # if game is not started (at init or after GAME_OVER) we need to reset
@@ -347,11 +355,11 @@ class RandomLayeredNextState(Agent):
         # If frame processing failed, reset tracking and return random action
         if frame_tensors is None:
             self.logger.error("Cannot parse current game frame.")
-            
             action = random.choice(self.action_list[:5])  # Random ACTION1-ACTION5
             action.reasoning = f"Skipped weird frame, random {action.value}"
 
             self.prev_frame = None  # Reset previous frame tracking on failure
+            self.prev_action = None
 
             return action
         
@@ -361,14 +369,16 @@ class RandomLayeredNextState(Agent):
             experience = Experience(
                 cur_frame=ft,  # Already numpy bool
                 prev_frame=self.prev_frame,
-                action=latest_frame.action_input.id,
+                action=self.prev_action,
                 diff_ravel_pixel_indices=diff_pixels,
             )
 
-            if self.prev_frame is not None:
+            if self.prev_frame is not None and self.prev_action is not None:
                 self.next_state_predictor.add_experience(experience)
 
             self.prev_frame = ft
+
+        self.prev_action = action
 
 
         if self.action_counter % self.train_frequency == 0:
