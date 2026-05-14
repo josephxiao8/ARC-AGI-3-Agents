@@ -778,6 +778,10 @@ HTML_TEMPLATE = """
         image-rendering: pixelated;
       }
 
+      #input-image.is-clickable-board {
+        cursor: crosshair;
+      }
+
       .metrics {
         display: grid;
         grid-template-columns: repeat(5, minmax(0, 1fr));
@@ -1234,6 +1238,10 @@ HTML_TEMPLATE = """
           const actionId = Number(button.dataset.actionId);
           button.classList.toggle("is-muted", !isActionAvailable(actionId));
         }
+        inputImage.classList.toggle(
+          "is-clickable-board",
+          getSourceMode() === "live" && isActionAvailable(6),
+        );
       }
 
       function setSourceMode() {
@@ -1245,6 +1253,7 @@ HTML_TEMPLATE = """
         } else {
           stopPlayback();
         }
+        updateActionButtons();
       }
 
       async function getJson(url) {
@@ -1460,6 +1469,20 @@ HTML_TEMPLATE = """
         }
       }
 
+      function handleInputBoardClick(event) {
+        if (getSourceMode() !== "live" || !isActionAvailable(6)) {
+          return;
+        }
+        if (!currentSnapshot) {
+          showToast("Start a game first.");
+          return;
+        }
+        const rect = inputImage.getBoundingClientRect();
+        const x = Math.max(0, Math.min(63, Math.floor(((event.clientX - rect.left) / rect.width) * 64)));
+        const y = Math.max(0, Math.min(63, Math.floor(((event.clientY - rect.top) / rect.height) * 64)));
+        sendAction(6, {x, y});
+      }
+
       function handleKeyboard(event) {
         if (getSourceMode() !== "live") {
           return;
@@ -1511,6 +1534,7 @@ HTML_TEMPLATE = """
         currentSnapshot = null;
         updateActionButtons();
       });
+      inputImage.addEventListener("click", handleInputBoardClick);
       window.addEventListener("keydown", handleKeyboard);
 
       buildModelOptions();
