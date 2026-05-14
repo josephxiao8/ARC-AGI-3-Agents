@@ -778,10 +778,6 @@ HTML_TEMPLATE = """
         image-rendering: pixelated;
       }
 
-      #live-current-image {
-        cursor: crosshair;
-      }
-
       .metrics {
         display: grid;
         grid-template-columns: repeat(5, minmax(0, 1fr));
@@ -984,10 +980,6 @@ HTML_TEMPLATE = """
             <h2>Next Gate</h2>
             <img id="next-gate-image" alt="Predicted next sigmoid gate">
           </div>
-          <div class="preview-panel">
-            <h2>Live Current</h2>
-            <img id="live-current-image" alt="Current live game frame">
-          </div>
         </div>
 
         <div class="metrics">
@@ -1054,7 +1046,6 @@ HTML_TEMPLATE = """
       const actualNextImage = document.getElementById("actual-next-image");
       const nextDynamicImage = document.getElementById("next-dynamic-image");
       const nextGateImage = document.getElementById("next-gate-image");
-      const liveCurrentImage = document.getElementById("live-current-image");
       const staticConfidenceValue = document.getElementById("static-confidence-value");
       const dynamicGateValue = document.getElementById("dynamic-gate-value");
       const dynamicStaticFracValue = document.getElementById("dynamic-static-frac-value");
@@ -1250,7 +1241,6 @@ HTML_TEMPLATE = """
         recordingControls.hidden = mode !== "recording";
         liveControls.hidden = mode !== "live";
         if (mode === "recording") {
-          setImage(liveCurrentImage, null);
           renderSelectedRecordingFrame();
         } else {
           stopPlayback();
@@ -1348,7 +1338,6 @@ HTML_TEMPLATE = """
           renderMeta(payload);
           renderLayerImages(payload.layers);
           setImage(actualNextImage, payload.actual_next_image);
-          setImage(liveCurrentImage, null);
         } catch (error) {
           showToast(error instanceof Error ? error.message : "Failed to render frame.");
         }
@@ -1394,7 +1383,6 @@ HTML_TEMPLATE = """
           currentSnapshot = payload.current;
           renderMeta(payload);
           renderLayerImages(payload.layers);
-          setImage(liveCurrentImage, payload.current.image);
           setImage(actualNextImage, null);
           updateActionButtons();
         } catch (error) {
@@ -1411,7 +1399,6 @@ HTML_TEMPLATE = """
           currentSnapshot = payload.current;
           renderMeta(payload);
           renderLayerImages(payload.layers);
-          setImage(liveCurrentImage, payload.current.image);
           setImage(actualNextImage, null);
           updateActionButtons();
         } catch (error) {
@@ -1432,7 +1419,6 @@ HTML_TEMPLATE = """
           currentSnapshot = payload.current;
           renderMeta(payload);
           renderLayerImages(payload.layers);
-          setImage(liveCurrentImage, payload.current.image);
           setImage(actualNextImage, null);
           updateActionButtons();
         } catch (error) {
@@ -1463,7 +1449,6 @@ HTML_TEMPLATE = """
           setImage(nextImage, payload.predicted_next_image);
           setImage(nextDynamicImage, payload.predicted_next_dynamic_image);
           setImage(actualNextImage, payload.current.image);
-          setImage(liveCurrentImage, payload.current.image);
           updateActionButtons();
           if (payload.current.state === "WIN") {
             showToast("Game won.");
@@ -1473,20 +1458,6 @@ HTML_TEMPLATE = """
         } catch (error) {
           showToast(error instanceof Error ? error.message : "Action failed.");
         }
-      }
-
-      function handleBoardClick(event) {
-        if (getSourceMode() !== "live") {
-          return;
-        }
-        if (!currentSnapshot) {
-          showToast("Start a game first.");
-          return;
-        }
-        const rect = liveCurrentImage.getBoundingClientRect();
-        const x = Math.max(0, Math.min(63, Math.floor(((event.clientX - rect.left) / rect.width) * 64)));
-        const y = Math.max(0, Math.min(63, Math.floor(((event.clientY - rect.top) / rect.height) * 64)));
-        sendAction(6, {x, y});
       }
 
       function handleKeyboard(event) {
@@ -1539,9 +1510,7 @@ HTML_TEMPLATE = """
       gameSelect.addEventListener("change", () => {
         currentSnapshot = null;
         updateActionButtons();
-        setImage(liveCurrentImage, null);
       });
-      liveCurrentImage.addEventListener("click", handleBoardClick);
       window.addEventListener("keydown", handleKeyboard);
 
       buildModelOptions();
