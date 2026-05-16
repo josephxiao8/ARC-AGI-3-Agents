@@ -41,7 +41,60 @@ class NextDynamicLayerPrediction(nn.Module):
             nn.Conv2d(self.embedding_dim, 1, kernel_size=3, padding=1),
         )
 
-        self.action_embedding = nn.Embedding(len(GameAction), action_dim)
+        # for simple actions
+        self.simple_action_embedding = nn.Embedding(len(GameAction), action_dim)
+        # for complex actions
+        self.complex_action_embedding = nn.Sequential(
+            nn.Linear(2, self.action_dim),  # x/y pixel coordinates
+            nn.ReLU(),
+            nn.RMSNorm(self.action_dim),
+            nn.Linear(self.action_dim, self.action_dim),
+            nn.ReLU(),
+            nn.RMSNorm(self.action_dim),
+            nn.Linear(self.action_dim, self.action_dim),
+        )
+
+    def _encode_actions(self, actions: list[GameAction]) -> mx.array:
+        if not actions:
+            return mx.zeros((0, self.action_dim))
+
+        embedding_indices: list[int] = []
+        embedding_batches: list[mx.array] = []
+        simple_actions = [
+            (index, action)
+            for index, action in enumerate(actions)
+            if action.is_simple()
+        ]
+        complex_actions = [
+            (index, action)
+            for index, action in enumerate(actions)
+            if action.is_complex()
+        ]
+
+        if simple_actions:
+            simple_indices, simple_batch = zip(*simple_actions)
+            embedding_indices.extend(simple_indices)
+            embedding_batches.append(
+                self.simple_action_embedding(
+                    mx.array([action.value for action in simple_batch])
+                )
+            )
+
+        if complex_actions:
+            complex_indices, complex_batch = zip(*complex_actions)
+            embedding_indices.extend(complex_indices)
+            complex_positions = mx.array(
+                [
+                    [action.action_data.x, action.action_data.y]
+                    for action in complex_batch
+                ],
+                dtype=mx.float32,
+            )
+            embedding_batches.append(self.complex_action_embedding(complex_positions))
+
+        action_embeddings = mx.concat(embedding_batches, axis=0)
+        original_order = mx.argsort(mx.array(embedding_indices))
+        return action_embeddings[original_order]
 
     def __call__(
         self,
@@ -55,7 +108,7 @@ class NextDynamicLayerPrediction(nn.Module):
         # gate_logits shape: (batch_size, height, width, 1)
         # actions is a list of GameAction enums of length batch_size
 
-        action_embeddings = self.action_embedding(mx.array([action.value for action in actions]))  # shape: (batch_size, action_dim)
+        action_embeddings = self._encode_actions(actions)
         action_embeddings = mx.broadcast_to(
             action_embeddings[:, None, None, :],
             dynamic_layer.shape[:-1] + (self.action_dim,),
