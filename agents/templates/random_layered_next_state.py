@@ -238,6 +238,18 @@ class NextStatePrediction:
         #     action_counter,
         # )
 
+        # self.writer.add_histogram(
+        #     'complex action coords x',
+        #     np.array([a.action_data.x for a in actions if a.is_complex()], dtype=np.int64),
+        #     action_counter,
+        # )
+        
+        # self.writer.add_histogram(
+        #     'complex action coords y',
+        #     np.array([a.action_data.y for a in actions if a.is_complex()], dtype=np.int64),
+        #     action_counter,
+        # )
+
         return total_loss
 
 class RandomLayeredNextState(Agent):
