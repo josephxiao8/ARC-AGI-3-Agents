@@ -328,6 +328,7 @@ class RandomVAENextState(Agent):
         # need a way to track wheter a new level has started
         self.levels_completed_prev = 0
         self.prev_frame: npt.NDArray[np.int64] | None = None
+        self.prev_action: GameAction | None = None
 
         self._reset_models()
 
@@ -388,6 +389,7 @@ class RandomVAENextState(Agent):
             self.next_state_predictor.clear_experience()
 
             self.prev_frame = None
+            self.prev_action = None
 
         if latest_frame.state in [GameState.NOT_PLAYED, GameState.GAME_OVER]:
             # if game is not started (at init or after GAME_OVER) we need to reset
@@ -424,6 +426,7 @@ class RandomVAENextState(Agent):
             action.reasoning = f"Skipped weird frame, random {action.value}"
 
             self.prev_frame = None  # Reset previous frame tracking on failure
+            self.prev_action = None
 
             return action
         
@@ -433,7 +436,7 @@ class RandomVAENextState(Agent):
             experience = Experience(
                 state=ft,  # Already numpy bool
                 prev_state=self.prev_frame,
-                action=latest_frame.action_input.id,
+                action=self.prev_action,
                 diff_ravel_pixel_indices=diff_pixels,
             )
             self.latent_encoder_decoder.add_experience(experience)
@@ -442,6 +445,7 @@ class RandomVAENextState(Agent):
                 self.next_state_predictor.add_experience(experience)
 
             self.prev_frame = ft
+            self.prev_action = action
 
 
         if self.action_counter % self.train_frequency == 0:
