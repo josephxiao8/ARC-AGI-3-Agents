@@ -124,6 +124,7 @@ class NextStatePrediction:
         prev_frames: mx.array,
         actions: list[GameAction],
         action_counter: int,
+        alpha: float = 1000.0,
         beta: float = 0.1,
     ) -> mx.array:
         (
@@ -194,7 +195,14 @@ class NextStatePrediction:
         next_gate_loss = reduce_per_pixel_loss(next_gate_ce)
         total_next_frame_loss = next_frame_loss + beta * next_gate_loss
 
-        total_loss = total_prev_frame_loss + total_next_frame_loss
+        static_layer_log_probs = nn.log_softmax(static_layer_logits, axis=-1) # (B, H, W, vocab_size)
+        static_layer_probs = mx.softmax(static_layer_logits, axis=-1) # (B, H, W, vocab_size)
+        mean_dist = mx.mean(static_layer_probs, axis=0, keepdims=True) # (1, H, W, vocab_size)
+
+        # Average KL from mean
+        kl_from_mean = nn.losses.kl_div_loss(mean_dist.log(), static_layer_log_probs, reduction='mean')
+
+        total_loss = total_prev_frame_loss + total_next_frame_loss + alpha * kl_from_mean
 
         self.writer.add_scalar(
             'Prev/reconstruction_loss',
@@ -224,6 +232,11 @@ class NextStatePrediction:
         self.writer.add_scalar(
             'Next/total_loss',
             total_next_frame_loss.item(),
+            action_counter,
+        )
+        self.writer.add_scalar(
+            'KL/kl_from_mean',
+            kl_from_mean.item(),
             action_counter,
         )
         self.writer.add_scalar(
