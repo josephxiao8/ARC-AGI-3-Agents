@@ -412,7 +412,7 @@ class LayeredVisualizer:
         dynamic_grid = decode_logits(dynamic_logits, mode)
         dynamic_gate = sigmoid_np(dynamic_gate_logits[..., 0])
         dynamic_static_mask = dynamic_gate >= 0.5
-        dynamic_display_grid = np.where(
+        dynamic_masked_grid = np.where(
             dynamic_static_mask,
             self.static_gate_token_id,
             dynamic_grid,
@@ -426,7 +426,7 @@ class LayeredVisualizer:
         next_dynamic_grid = decode_logits(next_dynamic_logits, mode)
         next_dynamic_gate = sigmoid_np(next_dynamic_gate_logits[..., 0])
         next_dynamic_static_mask = next_dynamic_gate >= 0.5
-        next_dynamic_display_grid = np.where(
+        next_dynamic_masked_grid = np.where(
             next_dynamic_static_mask,
             self.static_gate_token_id,
             next_dynamic_grid,
@@ -443,13 +443,21 @@ class LayeredVisualizer:
             "input": grid_to_data_url(frame),
             "static": layer_grid_to_data_url(static_grid),
             "dynamic": layer_grid_to_data_url(
-                dynamic_display_grid,
+                dynamic_grid,
+                static_gate_token_id=self.static_gate_token_id,
+            ),
+            "dynamic_masked": layer_grid_to_data_url(
+                dynamic_masked_grid,
                 static_gate_token_id=self.static_gate_token_id,
             ),
             "dynamic_gate": gate_to_data_url(dynamic_gate),
             "reconstruction": grid_to_data_url(reconstruction_grid),
             "next_dynamic": layer_grid_to_data_url(
-                next_dynamic_display_grid,
+                next_dynamic_grid,
+                static_gate_token_id=self.static_gate_token_id,
+            ),
+            "next_dynamic_masked": layer_grid_to_data_url(
+                next_dynamic_masked_grid,
                 static_gate_token_id=self.static_gate_token_id,
             ),
             "next_dynamic_gate": gate_to_data_url(next_dynamic_gate),
@@ -961,6 +969,10 @@ HTML_TEMPLATE = """
             <img id="dynamic-image" alt="Dynamic layer">
           </div>
           <div class="preview-panel">
+            <h2>Dynamic Masked</h2>
+            <img id="dynamic-masked-image" alt="Dynamic layer with static-gated cells masked">
+          </div>
+          <div class="preview-panel">
             <h2>Dynamic Gate</h2>
             <img id="dynamic-gate-image" alt="Dynamic sigmoid gate">
           </div>
@@ -979,6 +991,10 @@ HTML_TEMPLATE = """
           <div class="preview-panel">
             <h2>Next Dynamic</h2>
             <img id="next-dynamic-image" alt="Predicted next dynamic layer">
+          </div>
+          <div class="preview-panel">
+            <h2>Next Dynamic Masked</h2>
+            <img id="next-dynamic-masked-image" alt="Predicted next dynamic layer with static-gated cells masked">
           </div>
           <div class="preview-panel">
             <h2>Next Gate</h2>
@@ -1044,11 +1060,13 @@ HTML_TEMPLATE = """
       const inputImage = document.getElementById("input-image");
       const staticImage = document.getElementById("static-image");
       const dynamicImage = document.getElementById("dynamic-image");
+      const dynamicMaskedImage = document.getElementById("dynamic-masked-image");
       const dynamicGateImage = document.getElementById("dynamic-gate-image");
       const reconstructionImage = document.getElementById("reconstruction-image");
       const nextImage = document.getElementById("next-image");
       const actualNextImage = document.getElementById("actual-next-image");
       const nextDynamicImage = document.getElementById("next-dynamic-image");
+      const nextDynamicMaskedImage = document.getElementById("next-dynamic-masked-image");
       const nextGateImage = document.getElementById("next-gate-image");
       const staticConfidenceValue = document.getElementById("static-confidence-value");
       const dynamicGateValue = document.getElementById("dynamic-gate-value");
@@ -1130,10 +1148,12 @@ HTML_TEMPLATE = """
             inputImage,
             staticImage,
             dynamicImage,
+            dynamicMaskedImage,
             dynamicGateImage,
             reconstructionImage,
             nextImage,
             nextDynamicImage,
+            nextDynamicMaskedImage,
             nextGateImage,
           ]) {
             setImage(image, null);
@@ -1144,10 +1164,12 @@ HTML_TEMPLATE = """
         setImage(inputImage, layers.input);
         setImage(staticImage, layers.static);
         setImage(dynamicImage, layers.dynamic);
+        setImage(dynamicMaskedImage, layers.dynamic_masked);
         setImage(dynamicGateImage, layers.dynamic_gate);
         setImage(reconstructionImage, layers.reconstruction);
         setImage(nextImage, layers.next_reconstruction);
         setImage(nextDynamicImage, layers.next_dynamic);
+        setImage(nextDynamicMaskedImage, layers.next_dynamic_masked);
         setImage(nextGateImage, layers.next_dynamic_gate);
         renderMetrics(layers.metrics);
       }
@@ -1457,6 +1479,7 @@ HTML_TEMPLATE = """
           renderLayerImages(payload.current_layers);
           setImage(nextImage, payload.predicted_next_image);
           setImage(nextDynamicImage, payload.predicted_next_dynamic_image);
+          setImage(nextDynamicMaskedImage, payload.predicted_next_dynamic_masked_image);
           setImage(actualNextImage, payload.current.image);
           updateActionButtons();
           if (payload.current.state === "WIN") {
@@ -1825,6 +1848,7 @@ def create_app(
                     "current_layers": current_layers,
                     "predicted_next_image": before_layers["next_reconstruction"] if before_layers else None,
                     "predicted_next_dynamic_image": before_layers["next_dynamic"] if before_layers else None,
+                    "predicted_next_dynamic_masked_image": before_layers["next_dynamic_masked"] if before_layers else None,
                 }
             )
         except InvalidActionError as exc:
