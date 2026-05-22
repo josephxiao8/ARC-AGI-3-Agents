@@ -130,7 +130,7 @@ class NextStatePrediction:
         action_counter: int,
         alpha: float = 1000.0,
         beta: float = 0.1,
-        gamma: float = 10.0,
+        gamma: float = 100.0,
         hole_rate: float = 0.10,
     ) -> mx.array:
         (
