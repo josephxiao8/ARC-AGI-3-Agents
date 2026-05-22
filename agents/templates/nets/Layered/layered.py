@@ -145,7 +145,7 @@ class Layered(nn.Module):
         self.embedding_dim = self.token_embedding.weight.shape[1]
 
         self.backbone = nn.Sequential(
-            nn.Conv2d(self.embedding_dim, 64, kernel_size=3, padding=1),
+            nn.Conv2d(self.embedding_dim + 1, 64, kernel_size=3, padding=1),
             nn.ReLU(),
             nn.RMSNorm(64),
             nn.Conv2d(64, 128, kernel_size=3, padding=1),
@@ -236,10 +236,17 @@ class Layered(nn.Module):
     def decompose(
         self,
         x_0: mx.array,
+        input_mask: mx.array | None = None,
     ) -> tuple[mx.array, mx.array, mx.array, mx.array, mx.array]:
         # Embed the input tokens. mlx Conv2d expects shape
         # (batch_size, height, width, embedding_dim), so no permutation is needed.
         x_0 = self.token_embedding(x_0)
+        if input_mask is None:
+            input_mask = mx.zeros(x_0.shape[:-1] + (1,), dtype=x_0.dtype)
+        else:
+            input_mask = input_mask[..., None].astype(x_0.dtype)
+
+        x_0 = mx.concat([x_0, input_mask], axis=-1)
 
         features = self.backbone(x_0)  # shape: (batch_size, height, width, 256)
 

@@ -80,13 +80,17 @@ class NextStatePrediction:
         # Prepare batch data - convert numpy arrays to tensors and move to GPU
         frames_np = np.stack([exp.cur_frame for exp in batch])
         prev_frames_np = np.stack([exp.prev_frame for exp in batch])
-        
         frames = mx.array(frames_np)
         prev_frames = mx.array(prev_frames_np)
         actions = [exp.action for exp in batch]
 
 
-        _, grads = self.loss_and_grad_fn(frames, prev_frames, actions, action_counter)
+        _, grads = self.loss_and_grad_fn(
+            frames,
+            prev_frames,
+            actions,
+            action_counter,
+        )
         self.optimizer.update(self.net, grads)
         mx.eval(self.net.parameters(), self.optimizer.state)
 
@@ -126,6 +130,8 @@ class NextStatePrediction:
         action_counter: int,
         alpha: float = 1000.0,
         beta: float = 0.1,
+        gamma: float = 10.0,
+        hole_rate: float = 0.10,
     ) -> mx.array:
         (
             static_layer_logits,
@@ -173,6 +179,33 @@ class NextStatePrediction:
         prev_gate_loss = reduce_per_pixel_loss(prev_gate_ce)
         total_prev_frame_loss = prev_reconstruction_loss + beta * prev_gate_loss
 
+        hole_probs = hole_rate * prev_static_gate
+        hole_probs = hole_rate * prev_static_gate
+        inpaint_mask = mx.random.uniform(shape=prev_static_gate.shape) < hole_probs
+        inpaint_frames = mx.where(inpaint_mask, mx.zeros_like(prev_frames), prev_frames)
+        (
+            _,
+            _,
+            inpaint_static_layer_logits,
+            _,
+            _,
+        ) = self.net.decompose(
+            inpaint_frames,
+            input_mask=inpaint_mask,
+        )
+        inpaint_static_ce = nn.losses.cross_entropy(
+            inpaint_static_layer_logits,
+            prev_frames,
+        )
+        inpaint_mask_float = inpaint_mask.astype(inpaint_static_ce.dtype)
+        inpaint_weights = inpaint_mask_float * prev_static_gate
+        inpaint_weight_mass = mx.sum(inpaint_weights) + 1e-6
+        inpaint_average_ce = (
+            mx.sum(inpaint_static_ce * inpaint_weights) / inpaint_weight_mass
+        )
+        mean_inpaint_pixels = mx.mean(mx.sum(inpaint_mask_float, axis=(1, 2)))
+        background_inpainting_loss = inpaint_average_ce * mean_inpaint_pixels
+
         # Next-frame prediction. Reuse the previous-frame static layer and let the
         # predicted next dynamic layer decide when to override it.
         next_static_ce = nn.losses.cross_entropy(static_layer_logits, frames)
@@ -202,7 +235,12 @@ class NextStatePrediction:
         # Average KL from mean
         kl_from_mean = nn.losses.kl_div_loss(mean_dist.log(), static_layer_log_probs, reduction='mean')
 
-        total_loss = total_prev_frame_loss + total_next_frame_loss + alpha * kl_from_mean
+        total_loss = (
+            total_prev_frame_loss
+            + total_next_frame_loss
+            + gamma * background_inpainting_loss
+            + alpha * kl_from_mean
+        )
 
         self.writer.add_scalar(
             'Prev/reconstruction_loss',
@@ -232,6 +270,16 @@ class NextStatePrediction:
         self.writer.add_scalar(
             'Next/total_loss',
             total_next_frame_loss.item(),
+            action_counter,
+        )
+        self.writer.add_scalar(
+            'Inpaint/background_loss',
+            background_inpainting_loss.item(),
+            action_counter,
+        )
+        self.writer.add_scalar(
+            'Inpaint/hole_pixels',
+            mean_inpaint_pixels.item(),
             action_counter,
         )
         self.writer.add_scalar(
