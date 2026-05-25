@@ -411,6 +411,7 @@ class LayeredVisualizer:
         static_grid = decode_logits(static_logits, mode)
         dynamic_grid = decode_logits(dynamic_logits, mode)
         dynamic_gate = sigmoid_np(dynamic_gate_logits[..., 0])
+        dynamic_gate_cc = dynamic_gate
         dynamic_static_mask = dynamic_gate >= 0.5
         dynamic_masked_grid = np.where(
             dynamic_static_mask,
@@ -451,6 +452,7 @@ class LayeredVisualizer:
                 static_gate_token_id=self.static_gate_token_id,
             ),
             "dynamic_gate": gate_to_data_url(dynamic_gate),
+            "dynamic_gate_cc": gate_to_data_url(dynamic_gate_cc),
             "reconstruction": grid_to_data_url(reconstruction_grid),
             "next_dynamic": layer_grid_to_data_url(
                 next_dynamic_grid,
@@ -977,6 +979,10 @@ HTML_TEMPLATE = """
             <img id="dynamic-gate-image" alt="Dynamic sigmoid gate">
           </div>
           <div class="preview-panel">
+            <h2>Dynamic Gate CC</h2>
+            <img id="dynamic-gate-cc-image" alt="Dynamic gate connected components">
+          </div>
+          <div class="preview-panel">
             <h2>Reconstruction</h2>
             <img id="reconstruction-image" alt="Layered reconstruction">
           </div>
@@ -1062,6 +1068,7 @@ HTML_TEMPLATE = """
       const dynamicImage = document.getElementById("dynamic-image");
       const dynamicMaskedImage = document.getElementById("dynamic-masked-image");
       const dynamicGateImage = document.getElementById("dynamic-gate-image");
+      const dynamicGateCcImage = document.getElementById("dynamic-gate-cc-image");
       const reconstructionImage = document.getElementById("reconstruction-image");
       const nextImage = document.getElementById("next-image");
       const actualNextImage = document.getElementById("actual-next-image");
@@ -1150,6 +1157,7 @@ HTML_TEMPLATE = """
             dynamicImage,
             dynamicMaskedImage,
             dynamicGateImage,
+            dynamicGateCcImage,
             reconstructionImage,
             nextImage,
             nextDynamicImage,
@@ -1166,6 +1174,7 @@ HTML_TEMPLATE = """
         setImage(dynamicImage, layers.dynamic);
         setImage(dynamicMaskedImage, layers.dynamic_masked);
         setImage(dynamicGateImage, layers.dynamic_gate);
+        setImage(dynamicGateCcImage, layers.dynamic_gate_cc);
         setImage(reconstructionImage, layers.reconstruction);
         setImage(nextImage, layers.next_reconstruction);
         setImage(nextDynamicImage, layers.next_dynamic);
