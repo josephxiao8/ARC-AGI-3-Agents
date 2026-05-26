@@ -333,10 +333,25 @@ def gate_to_data_url(gate: np.ndarray | None) -> str | None:
     return image_to_data_url(create_gate_image(gate, cell_size=8, border_width=1))
 
 
+def gate_to_values(gate: np.ndarray | None) -> list[list[float]] | None:
+    if gate is None:
+        return None
+    gate = np.asarray(gate, dtype=np.float32).squeeze()
+    if gate.ndim != 2:
+        raise ValueError(f"Expected a 2D gate array, got {gate.shape}.")
+    return np.round(gate, 6).astype(float).tolist()
+
+
 def sigmoid_np(logits: np.ndarray) -> np.ndarray:
     logits = np.clip(logits, -80.0, 80.0)
     return 1.0 / (1.0 + np.exp(-logits))
 
+def isolate_cc(gate: np.ndarray) -> np.ndarray:
+    """
+    Args:
+    - gate: A 2D array of shape (height, width) representing the sigmoid gate values. 0 if fully dynamic, 1 if fully static.
+    """
+    return gate <= 0.5
 
 class LayeredVisualizer:
     def __init__(self, config_path: Path, weights_path: Path) -> None:
@@ -411,7 +426,7 @@ class LayeredVisualizer:
         static_grid = decode_logits(static_logits, mode)
         dynamic_grid = decode_logits(dynamic_logits, mode)
         dynamic_gate = sigmoid_np(dynamic_gate_logits[..., 0])
-        dynamic_gate_cc = dynamic_gate
+        dynamic_gate_cc = isolate_cc(dynamic_gate)
         dynamic_static_mask = dynamic_gate >= 0.5
         dynamic_masked_grid = np.where(
             dynamic_static_mask,
@@ -463,6 +478,11 @@ class LayeredVisualizer:
                 static_gate_token_id=self.static_gate_token_id,
             ),
             "next_dynamic_gate": gate_to_data_url(next_dynamic_gate),
+            "gate_values": {
+                "dynamic_gate": gate_to_values(dynamic_gate),
+                "dynamic_gate_cc": gate_to_values(dynamic_gate_cc),
+                "next_dynamic_gate": gate_to_values(next_dynamic_gate),
+            },
             "next_reconstruction": grid_to_data_url(next_reconstruction_grid),
             "metrics": {
                 "dynamic_gate_mean": float(dynamic_gate.mean()),
@@ -792,6 +812,25 @@ HTML_TEMPLATE = """
         cursor: crosshair;
       }
 
+      .gate-image {
+        cursor: crosshair;
+      }
+
+      .gate-tooltip {
+        position: fixed;
+        z-index: 10;
+        min-width: 118px;
+        padding: 6px 8px;
+        color: #fff;
+        background: rgba(32, 32, 32, 0.94);
+        border: 1px solid rgba(255, 255, 255, 0.14);
+        font-size: 12px;
+        font-variant-numeric: tabular-nums;
+        line-height: 1.35;
+        pointer-events: none;
+        transform: translate(12px, 12px);
+      }
+
       .metrics {
         display: grid;
         grid-template-columns: repeat(5, minmax(0, 1fr));
@@ -976,11 +1015,11 @@ HTML_TEMPLATE = """
           </div>
           <div class="preview-panel">
             <h2>Dynamic Gate</h2>
-            <img id="dynamic-gate-image" alt="Dynamic sigmoid gate">
+            <img id="dynamic-gate-image" class="gate-image" alt="Dynamic sigmoid gate">
           </div>
           <div class="preview-panel">
             <h2>Dynamic Gate CC</h2>
-            <img id="dynamic-gate-cc-image" alt="Dynamic gate connected components">
+            <img id="dynamic-gate-cc-image" class="gate-image" alt="Dynamic gate connected components">
           </div>
           <div class="preview-panel">
             <h2>Reconstruction</h2>
@@ -1004,7 +1043,7 @@ HTML_TEMPLATE = """
           </div>
           <div class="preview-panel">
             <h2>Next Gate</h2>
-            <img id="next-gate-image" alt="Predicted next sigmoid gate">
+            <img id="next-gate-image" class="gate-image" alt="Predicted next sigmoid gate">
           </div>
         </div>
 
@@ -1034,6 +1073,7 @@ HTML_TEMPLATE = """
     </div>
 
     <div id="toast" class="toast"></div>
+    <div id="gate-tooltip" class="gate-tooltip" hidden></div>
 
     <script>
       const games = {{ games|tojson }};
@@ -1081,6 +1121,7 @@ HTML_TEMPLATE = """
       const nextGateValue = document.getElementById("next-gate-value");
       const nextStaticFracValue = document.getElementById("next-static-frac-value");
       const toast = document.getElementById("toast");
+      const gateTooltip = document.getElementById("gate-tooltip");
       const modeInputs = [...document.querySelectorAll('input[name="decode-mode"]')];
       const sourceInputs = [...document.querySelectorAll('input[name="source-mode"]')];
 
@@ -1100,6 +1141,7 @@ HTML_TEMPLATE = """
       let renderRequestId = 0;
       let playTimer = null;
       let toastTimer = null;
+      let currentGateValues = {};
 
       function getDecodeMode() {
         const selected = modeInputs.find((input) => input.checked);
@@ -1149,6 +1191,60 @@ HTML_TEMPLATE = """
         nextStaticFracValue.textContent = formatPercent(metrics.next_static_gate_fraction);
       }
 
+      function setGateValues(values) {
+        currentGateValues = values || {};
+        hideGateTooltip();
+      }
+
+      function hideGateTooltip() {
+        gateTooltip.hidden = true;
+      }
+
+      function gateHoverPosition(event, image, values) {
+        const height = values.length;
+        const width = values[0]?.length || 0;
+        if (!height || !width) {
+          return null;
+        }
+
+        const rect = image.getBoundingClientRect();
+        const relX = (event.clientX - rect.left) / rect.width;
+        const relY = (event.clientY - rect.top) / rect.height;
+        if (relX < 0 || relX >= 1 || relY < 0 || relY >= 1) {
+          return null;
+        }
+
+        return {
+          x: Math.max(0, Math.min(width - 1, Math.floor(relX * width))),
+          y: Math.max(0, Math.min(height - 1, Math.floor(relY * height))),
+        };
+      }
+
+      function showGateTooltip(event, image, key, label) {
+        const values = currentGateValues[key];
+        if (!values) {
+          hideGateTooltip();
+          return;
+        }
+
+        const position = gateHoverPosition(event, image, values);
+        if (!position) {
+          hideGateTooltip();
+          return;
+        }
+
+        const value = values[position.y]?.[position.x];
+        if (!Number.isFinite(value)) {
+          hideGateTooltip();
+          return;
+        }
+
+        gateTooltip.innerHTML = `${label}<br>x ${position.x}, y ${position.y}<br>value ${value.toFixed(6)}`;
+        gateTooltip.style.left = `${event.clientX}px`;
+        gateTooltip.style.top = `${event.clientY}px`;
+        gateTooltip.hidden = false;
+      }
+
       function renderLayerImages(layers) {
         if (!layers) {
           for (const image of [
@@ -1167,6 +1263,7 @@ HTML_TEMPLATE = """
             setImage(image, null);
           }
           renderMetrics(null);
+          setGateValues(null);
           return;
         }
         setImage(inputImage, layers.input);
@@ -1181,6 +1278,7 @@ HTML_TEMPLATE = """
         setImage(nextDynamicMaskedImage, layers.next_dynamic_masked);
         setImage(nextGateImage, layers.next_dynamic_gate);
         renderMetrics(layers.metrics);
+        setGateValues(layers.gate_values);
       }
 
       function renderMeta(payload) {
@@ -1567,6 +1665,18 @@ HTML_TEMPLATE = """
         updateActionButtons();
       });
       inputImage.addEventListener("click", handleInputBoardClick);
+      dynamicGateImage.addEventListener("mousemove", (event) => {
+        showGateTooltip(event, dynamicGateImage, "dynamic_gate", "Dynamic gate");
+      });
+      dynamicGateImage.addEventListener("mouseleave", hideGateTooltip);
+      dynamicGateCcImage.addEventListener("mousemove", (event) => {
+        showGateTooltip(event, dynamicGateCcImage, "dynamic_gate_cc", "Dynamic gate CC");
+      });
+      dynamicGateCcImage.addEventListener("mouseleave", hideGateTooltip);
+      nextGateImage.addEventListener("mousemove", (event) => {
+        showGateTooltip(event, nextGateImage, "next_dynamic_gate", "Next gate");
+      });
+      nextGateImage.addEventListener("mouseleave", hideGateTooltip);
       window.addEventListener("keydown", handleKeyboard);
 
       buildModelOptions();
@@ -1957,9 +2067,9 @@ def main() -> None:
     app.run(
         host=args.host,
         port=args.port,
-        debug=False,
+        debug=True,
         threaded=False,
-        use_reloader=False,
+        use_reloader=True,
     )
 
 
