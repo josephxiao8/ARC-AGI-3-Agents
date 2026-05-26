@@ -16,6 +16,7 @@ import numpy.typing as npt
 from arcengine import FrameData, GameAction, GameState
 from tensorboardX import SummaryWriter
 
+from agents.templates.nets import ActionModel
 from utils import (
     get_environment_directory,
     setup_experiment_directory,
@@ -359,6 +360,7 @@ class RandomLayeredRL(Agent):
             base_dir=self.base_dir,
             writer=self.writer
         )
+        self.action_model = ActionModel(input_channels=self.num_colours, grid_size=self.grid_size)
 
     @property
     def name(self) -> str:
@@ -381,6 +383,80 @@ class RandomLayeredRL(Agent):
             self._save_models()  # Save model on completion
 
         return done
+    
+    def choose_action_after_level_zero(self, frame: npt.NDArray[np.int64], available_actions: list[GameAction]) -> GameAction:
+        logits = self.action_model(mx.array(frame)[None, ...])  # Add batch dimension
+        return self._sample_from_combined_output(logits.squeeze(0), available_actions)
+
+    def _sample_from_combined_output(self, combined_logits: mx.array, available_actions: list[GameAction]) -> tuple[GameAction, int, int, np.ndarray]:
+        """
+        Sample from combined 5 + 64x64 action space with masking for invalid actions.
+        
+        Adapted from https://github.com/DriesSmit/ARC3-solution/blob/main/custom_agents/action.py
+        """
+        action_list = (
+            GameAction.ACTION1,
+            GameAction.ACTION2,
+            GameAction.ACTION3,
+            GameAction.ACTION4,
+            GameAction.ACTION5,
+            GameAction.ACTION7,
+        )
+
+        # Split logits
+        action_logits = combined_logits[:6]  # First 6 for ACTION1-ACTION5 and ACTION7
+        coord_logits = combined_logits[6:]   # Remaining 4096 for ACTION6 coordinates
+
+        
+        action_mask = mx.full(action_logits.shape, float("-inf"))
+        for action in available_actions:
+            if action in action_list:
+                idx = action_list.index(action)
+                action_mask[idx] = 0.0
+        action_logits = action_logits + action_mask
+
+        if GameAction.ACTION6 not in available_actions:
+            coord_mask = mx.full(coord_logits.shape, float('-inf'))
+            coord_logits = coord_logits + coord_mask
+
+        # Apply sigmoid
+        action_probs = mx.sigmoid(action_logits)
+        coord_probs_raw = mx.sigmoid(coord_logits)
+        
+        # For fair sampling: treat coordinates as one action type with total prob divided by 4096
+        coord_probs_scaled = coord_probs_raw / self.num_coordinates
+        
+        # Combine for sampling (normalize)
+        all_probs_sampling = mx.concatenate([action_probs, coord_probs_scaled], axis=-1)
+        all_probs_sampling_np = np.asarray(all_probs_sampling)
+        prob_sum = all_probs_sampling_np.sum()
+        if not np.isfinite(prob_sum) or prob_sum <= 0:
+            raise ValueError(
+                "No valid action probabilities available for sampling: "
+                f"available_actions={available_actions}, prob_sum={prob_sum}"
+            )
+        all_probs_sampling_np = all_probs_sampling_np / prob_sum
+        
+        # Sample from normalized space
+        selected_idx = np.random.choice(len(all_probs_sampling_np), p=all_probs_sampling_np)
+        
+        # Return unnormalized sigmoid values for visualization
+        coord_probs_viz = mx.sigmoid(coord_logits)  # Raw sigmoid for visualization
+        all_probs_viz = mx.concatenate([action_probs, coord_probs_viz], axis=-1)
+        all_probs_viz_np = np.asarray(all_probs_viz)
+
+
+        # self.writer.add_histogram('Sampled_Action', selected_idx, self.action_counter)
+        
+        if selected_idx < 6: 
+            # Selected one of ACTION1-ACTION5 or ACTION7
+            return action_list[selected_idx], None, None, all_probs_viz_np
+        else:
+            # Selected a coordinate (index 6-4100)
+            coord_idx = selected_idx - 6
+            y_idx = coord_idx // self.grid_size
+            x_idx = coord_idx % self.grid_size
+            return GameAction.ACTION6, (y_idx, x_idx), coord_idx, all_probs_viz_np
 
     def choose_action(
         self, frames: list[FrameData], latest_frame: FrameData
@@ -397,28 +473,6 @@ class RandomLayeredRL(Agent):
 
             self.prev_frame = None
             self.prev_action = None
-
-        if latest_frame.state in [GameState.NOT_PLAYED, GameState.GAME_OVER]:
-            # if game is not started (at init or after GAME_OVER) we need to reset
-            # add a small delay before resetting after GAME_OVER to avoid timeout
-            action = GameAction.RESET
-        else:
-            # else choose a random action that isnt reset
-            action = random.choice([a for a in GameAction if a is not GameAction.RESET and a.value in latest_frame.available_actions])
-
-        if action.is_simple():
-            action.reasoning = f"RNG told me to pick {action.value}"
-        elif action.is_complex():
-            action.set_data(
-                {
-                    "x": random.randint(0, 63),
-                    "y": random.randint(0, 63),
-                }
-            )
-            action.reasoning = {
-                "desired_action": f"{action.value}",
-                "my_reason": "RNG said so!",
-            }
 
         
         # store frame examples for training
@@ -451,11 +505,37 @@ class RandomLayeredRL(Agent):
 
             self.prev_frame = ft
 
-        self.prev_action = action
-
 
         if self.action_counter % self.train_frequency == 0:
             self.next_state_predictor.train_batch(self.action_counter)
+
+
+        if latest_frame.state in [GameState.NOT_PLAYED, GameState.GAME_OVER]:
+            # if game is not started (at init or after GAME_OVER) we need to reset
+            # add a small delay before resetting after GAME_OVER to avoid timeout
+            action = GameAction.RESET
+        else:
+            # else choose a random action that isnt reset
+            available_actions = [a for a in GameAction if a is not GameAction.RESET and a.value in latest_frame.available_actions]
+            action = random.choice(available_actions) \
+                if latest_frame.levels_completed == 0 else self.choose_action_after_level_zero(frame_tensors[-1], available_actions)[0]
+
+        if action.is_simple():
+            action.reasoning = f"RNG told me to pick {action.value}"
+        elif action.is_complex():
+            action.set_data(
+                {
+                    "x": random.randint(0, 63),
+                    "y": random.randint(0, 63),
+                }
+            )
+            action.reasoning = {
+                "desired_action": f"{action.value}",
+                "my_reason": "RNG said so!",
+            }
+
+
+        self.prev_action = action
 
         return action
 
