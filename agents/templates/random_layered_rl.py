@@ -313,6 +313,100 @@ class NextStatePrediction:
         # )
 
         return total_loss
+    
+class RLActionModel:
+    def __init__(
+        self,
+        base_dir: str,
+        writer: SummaryWriter,
+        num_colours: int,
+        available_simple_actions: list[GameAction],
+        is_coord_action_allowed: bool,
+        grid_size: int,
+    ) -> None:
+        self.base_dir = base_dir
+        self.writer = writer
+        self.num_colours = num_colours
+        self.available_simple_actions = available_simple_actions
+        self.is_coord_action_allowed = is_coord_action_allowed
+        self.grid_size = grid_size
+        self.num_coordinates = grid_size * grid_size
+        self.logger = logging.getLogger("RLActionModel")
+        self.net = ActionModel(
+            num_colors=num_colours,
+            num_simple_action_types=len(available_simple_actions),
+            is_coord_action_allowed=is_coord_action_allowed,
+        )
+
+    def choose_action(
+        self,
+        frame: npt.NDArray[np.int64],
+    ) -> tuple[GameAction, tuple[int, int] | None, int | None, np.ndarray]:
+        logits = self.net(mx.array(frame)[None, ...])  # Add batch dimension
+        return self._sample_from_combined_output(logits.squeeze(0))
+
+    def _sample_from_combined_output(
+        self,
+        combined_logits: mx.array,
+    ) -> tuple[GameAction, tuple[int, int] | None, int | None, np.ndarray]:
+        """
+        Sample from combined simple + 64x64 action space.
+
+        Adapted from https://github.com/DriesSmit/ARC3-solution/blob/main/custom_agents/action.py
+        """
+        num_simple_action_types = len(self.available_simple_actions)
+        action_logits = combined_logits[:num_simple_action_types]
+        coord_logits = combined_logits[num_simple_action_types:]
+
+        action_probs = mx.sigmoid(action_logits)
+        coord_probs_raw = mx.sigmoid(coord_logits)
+
+        # Treat coordinates as one action type by sharing their probability mass.
+        coord_probs_scaled = coord_probs_raw / self.num_coordinates
+
+        all_probs_sampling = mx.concatenate([action_probs, coord_probs_scaled], axis=-1)
+        all_probs_sampling_np = np.asarray(all_probs_sampling)
+        prob_sum = all_probs_sampling_np.sum()
+        if not np.isfinite(prob_sum) or prob_sum <= 0:
+            raise ValueError(
+                "No valid action probabilities available for sampling: "
+                f"available_actions={self.available_simple_actions}, prob_sum={prob_sum}"
+            )
+        all_probs_sampling_np = all_probs_sampling_np / prob_sum
+
+        selected_idx = np.random.choice(len(all_probs_sampling_np), p=all_probs_sampling_np)
+
+        coord_probs_viz = mx.sigmoid(coord_logits)
+        all_probs_viz = mx.concatenate([action_probs, coord_probs_viz], axis=-1)
+        all_probs_viz_np = np.asarray(all_probs_viz)
+
+        if selected_idx < num_simple_action_types:
+            return self.available_simple_actions[selected_idx], None, None, all_probs_viz_np
+
+        coord_idx = selected_idx - num_simple_action_types
+        y_idx = coord_idx // self.grid_size
+        x_idx = coord_idx % self.grid_size
+        return GameAction.ACTION6, (y_idx, x_idx), coord_idx, all_probs_viz_np
+
+    def save_model(self, id="final") -> None:
+        model_path = os.path.join(self.base_dir, f"action_model_{id}.safetensors")
+        config_path = os.path.join(self.base_dir, f"action_model_{id}.json")
+
+        self.net.save_weights(model_path)
+
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "num_colors": self.num_colours,
+                    "num_simple_action_types": len(self.available_simple_actions),
+                    "is_coord_action_allowed": self.is_coord_action_allowed,
+                },
+                f,
+                indent=2,
+            )
+
+        self.logger.info(f"Saved action-model weights to {model_path}")
+        self.logger.info(f"Saved action-model config to {config_path}")
 
 class RandomLayeredRL(Agent):
     """An agent that always selects actions at random."""
@@ -353,12 +447,23 @@ class RandomLayeredRL(Agent):
         self.logger.info(f"Action agent initialized for game_id: {self.game_id}")
 
 
-    def _reset_models(self, num_simple_actions: int, is_coord_action_allowed: bool) -> None:
+    def _reset_models(
+        self,
+        available_simple_actions: list[GameAction],
+        is_coord_action_allowed: bool,
+    ) -> None:
         self.next_state_predictor = NextStatePrediction(
             base_dir=self.base_dir,
             writer=self.writer
         )
-        self.action_model = ActionModel(num_colors=self.num_colours, num_simple_actions_types=num_simple_actions, is_coord_action_allowed=is_coord_action_allowed)
+        self.action_model = RLActionModel(
+            base_dir=self.base_dir,
+            writer=self.writer,
+            num_colours=self.num_colours,
+            available_simple_actions=available_simple_actions,
+            is_coord_action_allowed=is_coord_action_allowed,
+            grid_size=self.grid_size,
+        )
 
     @property
     def name(self) -> str:
@@ -382,89 +487,21 @@ class RandomLayeredRL(Agent):
 
         return done
     
-    def choose_action_after_level_zero(self, frame: npt.NDArray[np.int64], available_actions: list[GameAction]) -> GameAction:
-        logits = self.action_model(mx.array(frame)[None, ...])  # Add batch dimension
-        return self._sample_from_combined_output(logits.squeeze(0), available_actions)
-
-    def _sample_from_combined_output(self, combined_logits: mx.array, available_actions: list[GameAction]) -> tuple[GameAction, int, int, np.ndarray]:
-        """
-        Sample from combined 5 + 64x64 action space with masking for invalid actions.
-        
-        Adapted from https://github.com/DriesSmit/ARC3-solution/blob/main/custom_agents/action.py
-        """
-        action_list = (
-            GameAction.ACTION1,
-            GameAction.ACTION2,
-            GameAction.ACTION3,
-            GameAction.ACTION4,
-            GameAction.ACTION5,
-            GameAction.ACTION7,
-        )
-
-        # Split logits
-        action_logits = combined_logits[:6]  # First 6 for ACTION1-ACTION5 and ACTION7
-        coord_logits = combined_logits[6:]   # Remaining 4096 for ACTION6 coordinates
-
-        
-        action_mask = mx.full(action_logits.shape, float("-inf"))
-        for action in available_actions:
-            if action in action_list:
-                idx = action_list.index(action)
-                action_mask[idx] = 0.0
-        action_logits = action_logits + action_mask
-
-        if GameAction.ACTION6 not in available_actions:
-            coord_mask = mx.full(coord_logits.shape, float('-inf'))
-            coord_logits = coord_logits + coord_mask
-
-        # Apply sigmoid
-        action_probs = mx.sigmoid(action_logits)
-        coord_probs_raw = mx.sigmoid(coord_logits)
-        
-        # For fair sampling: treat coordinates as one action type with total prob divided by 4096
-        coord_probs_scaled = coord_probs_raw / self.num_coordinates
-        
-        # Combine for sampling (normalize)
-        all_probs_sampling = mx.concatenate([action_probs, coord_probs_scaled], axis=-1)
-        all_probs_sampling_np = np.asarray(all_probs_sampling)
-        prob_sum = all_probs_sampling_np.sum()
-        if not np.isfinite(prob_sum) or prob_sum <= 0:
-            raise ValueError(
-                "No valid action probabilities available for sampling: "
-                f"available_actions={available_actions}, prob_sum={prob_sum}"
-            )
-        all_probs_sampling_np = all_probs_sampling_np / prob_sum
-        
-        # Sample from normalized space
-        selected_idx = np.random.choice(len(all_probs_sampling_np), p=all_probs_sampling_np)
-        
-        # Return unnormalized sigmoid values for visualization
-        coord_probs_viz = mx.sigmoid(coord_logits)  # Raw sigmoid for visualization
-        all_probs_viz = mx.concatenate([action_probs, coord_probs_viz], axis=-1)
-        all_probs_viz_np = np.asarray(all_probs_viz)
-
-
-        # self.writer.add_histogram('Sampled_Action', selected_idx, self.action_counter)
-        
-        if selected_idx < 6: 
-            # Selected one of ACTION1-ACTION5 or ACTION7
-            return action_list[selected_idx], None, None, all_probs_viz_np
-        else:
-            # Selected a coordinate (index 6-4100)
-            coord_idx = selected_idx - 6
-            y_idx = coord_idx // self.grid_size
-            x_idx = coord_idx % self.grid_size
-            return GameAction.ACTION6, (y_idx, x_idx), coord_idx, all_probs_viz_np
-
     def choose_action(
         self, frames: list[FrameData], latest_frame: FrameData
     ) -> GameAction:
         """Choose which action the Agent should take, fill in any arguments, and return it."""
 
         if self.action_counter == 0:
-            num_simple_actions = len([a for a in GameAction if a.is_simple() and a is not GameAction.RESET and a.value in latest_frame.available_actions])
+            # safe to assume that a game's available actions are the same throughout
+            # https://www.kaggle.com/competitions/arc-prize-2026-arc-agi-3/discussion/702079#3461836
+            available_simple_actions = [a for a in GameAction if a.is_simple() and a is not GameAction.RESET and a.value in latest_frame.available_actions]
+            num_simple_actions = len(available_simple_actions)
             is_coord_action_allowed = GameAction.ACTION6.value in latest_frame.available_actions
-            self._reset_models(num_simple_actions=num_simple_actions, is_coord_action_allowed=is_coord_action_allowed)
+            self._reset_models(
+                available_simple_actions=available_simple_actions,
+                is_coord_action_allowed=is_coord_action_allowed,
+            )
 
             self.logger.info(f"Instantiating models with num_simple_actions={num_simple_actions} and is_coord_action_allowed={is_coord_action_allowed}")
 
@@ -521,23 +558,28 @@ class RandomLayeredRL(Agent):
             action = GameAction.RESET
         else:
             # else choose a random action that isnt reset
-            available_actions = [a for a in GameAction if a is not GameAction.RESET and a.value in latest_frame.available_actions]
-            action = random.choice(available_actions) \
-                if latest_frame.levels_completed == 0 else self.choose_action_after_level_zero(frame_tensors[-1], available_actions)[0]
 
-        if action.is_simple():
-            action.reasoning = f"RNG told me to pick {action.value}"
-        elif action.is_complex():
-            action.set_data(
-                {
-                    "x": random.randint(0, 63),
-                    "y": random.randint(0, 63),
-                }
-            )
-            action.reasoning = {
-                "desired_action": f"{action.value}",
-                "my_reason": "RNG said so!",
-            }
+            if latest_frame.levels_completed == 0:
+                available_actions = [a for a in GameAction if a is not GameAction.RESET and a.value in latest_frame.available_actions]
+                action = random.choice(available_actions)
+                if action.is_complex():
+                    action.set_data(
+                        {
+                            "x": random.randint(0, 63),
+                            "y": random.randint(0, 63),
+                        }
+                    )
+                action.reasoning = f"Randomly sampled action at level 0: {action.value}"
+            else:
+                action, coords, _, _ = self.action_model.choose_action(frame_tensors[-1])
+                y, x = coords if coords is not None else (None, None)
+                if action.is_complex():
+                    action.set_data(
+                        {
+                            "x": x,
+                            "y": y,
+                        }
+                    )
 
 
         self.prev_action = action
@@ -564,5 +606,6 @@ class RandomLayeredRL(Agent):
 
     def _save_models(self, id="final") -> None:
         self.next_state_predictor.save_model(id=f"{self.game_id}_{id}")
+        self.action_model.save_model(id=f"{self.game_id}_{id}")
 
         self.logger.info(f"Saved models with id {id}")
