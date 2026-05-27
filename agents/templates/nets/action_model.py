@@ -6,15 +6,14 @@ import mlx.core as mx
 class ActionModel(nn.Module):
     """CNN that predicts which actions will result in new frames with shared conv backbone."""
     
-    def __init__(self, num_colors=16, input_channels=16, grid_size=64):
+    def __init__(self, num_colors=16, num_simple_actions_types=6, is_coord_action_allowed=False):
         super().__init__()
-        self.grid_size = grid_size
         self.num_action_types = 6  # ACTION1-ACTION5, ACTION7
 
-        self.embedding = nn.Embedding(num_colors, input_channels)  # Embed frame values into channels
+        self.embedding = nn.Embedding(num_colors, 16)  # Embed frame values into channels
         
         # Shared convolutional backbone
-        self.conv1 = nn.Conv2d(input_channels, 32, kernel_size=3, padding=1)
+        self.conv1 = nn.Conv2d(16, 32, kernel_size=3, padding=1)
         self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
         self.conv3 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
         self.conv4 = nn.Conv2d(128, 256, kernel_size=3, padding=1)

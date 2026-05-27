@@ -350,17 +350,15 @@ class RandomLayeredRL(Agent):
         self.prev_frame: npt.NDArray[np.int64] | None = None
         self.prev_action: GameAction | None = None
 
-        self._reset_models()
-
         self.logger.info(f"Action agent initialized for game_id: {self.game_id}")
 
 
-    def _reset_models(self) -> None:
+    def _reset_models(self, num_simple_actions: int, is_coord_action_allowed: bool) -> None:
         self.next_state_predictor = NextStatePrediction(
             base_dir=self.base_dir,
             writer=self.writer
         )
-        self.action_model = ActionModel(input_channels=self.num_colours, grid_size=self.grid_size)
+        self.action_model = ActionModel(num_colors=self.num_colours, num_simple_actions_types=num_simple_actions, is_coord_action_allowed=is_coord_action_allowed)
 
     @property
     def name(self) -> str:
@@ -462,6 +460,13 @@ class RandomLayeredRL(Agent):
         self, frames: list[FrameData], latest_frame: FrameData
     ) -> GameAction:
         """Choose which action the Agent should take, fill in any arguments, and return it."""
+
+        if self.action_counter == 0:
+            num_simple_actions = len([a for a in GameAction if a.is_simple() and a is not GameAction.RESET and a.value in latest_frame.available_actions])
+            is_coord_action_allowed = GameAction.ACTION6.value in latest_frame.available_actions
+            self._reset_models(num_simple_actions=num_simple_actions, is_coord_action_allowed=is_coord_action_allowed)
+
+            self.logger.info(f"Instantiating models with num_simple_actions={num_simple_actions} and is_coord_action_allowed={is_coord_action_allowed}")
 
         if latest_frame.levels_completed > self.levels_completed_prev:
             self.levels_completed_prev = latest_frame.levels_completed
