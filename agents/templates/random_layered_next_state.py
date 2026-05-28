@@ -49,12 +49,18 @@ class NextStatePrediction:
 
     def add_experience(self, experience: Experience) -> None:
         assert experience.prev_frame is not None, "Previous state is required for next state prediction."
+        assert experience.action is not None, "Action is required for next state prediction."
 
-        # Check if (current, previous) state pair is unique using a hash of the current state
+        # Check if (current, previous, action) state pair is unique using a hash of the current state
 
         hasher = hashlib.md5()
         hasher.update(experience.prev_frame.tobytes())
         hasher.update(experience.cur_frame.tobytes())
+        hasher.update(experience.action.value.to_bytes())
+        if experience.action.is_complex() and experience.action.action_data is not None:
+            hasher.update(experience.action.action_data.x.to_bytes())
+            hasher.update(experience.action.action_data.y.to_bytes())
+
         combined_hash = hasher.hexdigest()
 
         if combined_hash not in self.experience_hashes:
