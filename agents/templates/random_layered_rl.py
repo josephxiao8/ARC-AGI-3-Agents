@@ -6,7 +6,7 @@ import random
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -50,12 +50,18 @@ class NextStatePrediction:
 
     def add_experience(self, experience: Experience) -> None:
         assert experience.prev_frame is not None, "Previous state is required for next state prediction."
+        assert experience.action is not None, "Action is required for next state prediction."
 
-        # Check if (current, previous) state pair is unique using a hash of the current state
+        # Check if (current, previous, action) state pair is unique using a hash of the current state
 
         hasher = hashlib.md5()
         hasher.update(experience.prev_frame.tobytes())
         hasher.update(experience.cur_frame.tobytes())
+        hasher.update(experience.action.value.to_bytes())
+        if experience.action.is_complex() and experience.action.action_data is not None:
+            hasher.update(experience.action.action_data.x.to_bytes())
+            hasher.update(experience.action.action_data.y.to_bytes())
+
         combined_hash = hasher.hexdigest()
 
         if combined_hash not in self.experience_hashes:
@@ -323,6 +329,8 @@ class RLActionModel:
         available_simple_actions: list[GameAction],
         is_coord_action_allowed: bool,
         grid_size: int,
+
+        get_ccs_fn = Callable[[npt.NDArray[np.int64]], npt.NDArray[np.int64]],
     ) -> None:
         self.base_dir = base_dir
         self.writer = writer
@@ -332,11 +340,48 @@ class RLActionModel:
         self.grid_size = grid_size
         self.num_coordinates = grid_size * grid_size
         self.logger = logging.getLogger("RLActionModel")
+        self.experience_buffer: deque[Experience] = deque(maxlen=100_000)
+        self.experience_hashes = set()
+
+        self.get_ccs_fn = get_ccs_fn
+
+        self._reset_model()
+        self.logger.info("Initialized RLActionModel module")
+
+    def _reset_model(self) -> None:
         self.net = ActionModel(
-            num_colors=num_colours,
-            num_simple_action_types=len(available_simple_actions),
-            is_coord_action_allowed=is_coord_action_allowed,
+            num_colors=self.num_colours,
+            num_simple_action_types=len(self.available_simple_actions),
+            is_coord_action_allowed=self.is_coord_action_allowed,
         )
+        self.optimizer = optim.AdamW(learning_rate=0.001) # TODO: tune
+        self.loss_and_grad_fn = nn.value_and_grad(self.net, self._loss_fn)
+
+    def add_experience(self, experience: Experience) -> None:
+        assert experience.prev_frame is not None, "Previous state is required for action prediction."
+        assert experience.action is not None, "Action is required for action prediction."
+
+        # Check if (current, previous, action) state pair is unique using a hash of the current state
+
+        hasher = hashlib.md5()
+        hasher.update(experience.prev_frame.tobytes())
+        hasher.update(experience.cur_frame.tobytes())
+        hasher.update(experience.action.value.to_bytes())
+        if experience.action.is_complex() and experience.action.action_data is not None:
+            hasher.update(experience.action.action_data.x.to_bytes())
+            hasher.update(experience.action.action_data.y.to_bytes())
+
+        combined_hash = hasher.hexdigest()
+
+        if combined_hash not in self.experience_hashes:
+            self.experience_hashes.add(combined_hash)
+            self.experience_buffer.append(experience)
+
+    def clear_experience(self) -> None:
+        self.experience_buffer.clear()
+        self.experience_hashes.clear()
+
+        self.logger.info("Cleared experience buffer for RLActionModel.")
 
     def choose_action(
         self,
@@ -407,6 +452,81 @@ class RLActionModel:
 
         self.logger.info(f"Saved action-model weights to {model_path}")
         self.logger.info(f"Saved action-model config to {config_path}")
+
+
+    def set_winning_frame(self, winning_frames: npt.NDArray[np.int64], initial_frames: npt.NDArray[np.int64]) -> None:
+        self.winning_frames = winning_frames
+        self.initial_frames = initial_frames
+
+    def train_batch(self, action_counter: int, batch_size: int = 8) -> None:
+        if len(self.experience_buffer) < batch_size:
+            return
+        
+        self.net.train()
+
+        # Sample batch from experience buffer
+        batch_indices = np.random.choice(len(self.experience_buffer), batch_size, replace=False)
+        batch = [self.experience_buffer[i] for i in batch_indices]
+
+        # Prepare batch data - convert numpy arrays to tensors and move to GPU
+        frames_np = np.stack([exp.cur_frame for exp in batch])
+        prev_frames_np = np.stack([exp.prev_frame for exp in batch])
+        frames = mx.array(frames_np)
+        prev_frames = mx.array(prev_frames_np)
+        actions = [exp.action for exp in batch]
+
+
+        _, grads = self.loss_and_grad_fn(
+            prev_frames,
+            actions,
+            action_counter,
+        )
+
+        self.optimizer.update(self.net, grads)
+        mx.eval(self.net.parameters(), self.optimizer.state)
+
+
+    def _loss_fn(self, frames: mx.array, actions: list[GameAction], action_counter: int) -> mx.array:
+        combined_logits = self.net(frames)  # (batch, # actions)
+        num_simple_action_types = len(self.available_simple_actions)
+        action_indices = mx.array([
+            self.available_simple_actions.index(a) \
+            if a in self.available_simple_actions \
+            else num_simple_action_types + (a.action_data.y * self.grid_size + a.action_data.x) \
+            for a in actions
+         ], dtype=mx.int64).unsqueeze(1)  # (batch, 1)
+        
+
+        # TODO: compute rewards
+        # we are going to encourage actions that result in "relations" between connected components
+        # being "similar" to those learned at the end of the previous level
+        rewards = mx.zeros_like(action_indices, dtype=mx.float32)
+        
+        # Single unified loss - only if there's at least one positive reward
+        selected_logits = mx.take_along_axis(combined_logits, action_indices, axis=1)
+        main_loss = nn.losses.binary_cross_entropy(selected_logits, rewards, with_logits=True)
+        
+        # Light entropy regularization - encourage exploration via high sigmoid values
+        all_probs = mx.sigmoid(combined_logits)
+        
+        # Split into action and coordinate spaces
+        action_probs = all_probs[:, :num_simple_action_types]
+        coord_probs = all_probs[:, num_simple_action_types:]
+        
+        # TODO: this entropy stuff makes no sense, fix
+        # Calculate entropy bonus based on raw sigmoid values (higher values = more confident exploration)
+        action_entropy = action_probs.mean()  # Mean sigmoid activation (0-1 range)
+        coord_entropy = coord_probs.mean()    # Mean sigmoid activation (0-1 range)
+        
+        # Get dynamic entropy coefficients from scheduler
+        action_coeff=0.0001
+        coord_coeff=0.00001
+        
+        # Apply dynamic entropy regularization
+        total_loss = main_loss - action_coeff * action_entropy - coord_coeff * coord_entropy
+        
+        return total_loss
+
 
 class RandomLayeredRL(Agent):
     """An agent that always selects actions at random."""
