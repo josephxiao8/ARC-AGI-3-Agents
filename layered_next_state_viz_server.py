@@ -4,6 +4,7 @@ import argparse
 import base64
 import io
 import json
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
@@ -19,6 +20,9 @@ from PIL import Image, ImageDraw
 from agents.recorder import RECORDING_SUFFIX
 from agents.templates.nets import Layered
 from view_utils import create_grid_image, hex_to_rgb, key_colors
+
+
+WINNING_REFERENCE_HISTORY_LENGTH = 4
 
 
 @dataclass(frozen=True)
@@ -58,6 +62,20 @@ def list_model_paths(runs_dir: Path) -> list[ModelPaths]:
         return model_paths
 
     for config_path in sorted(runs_dir.rglob("layered_next_state_model_*.json")):
+        weights_path = config_path.with_suffix(".safetensors")
+        if weights_path.exists():
+            model_paths.append(
+                ModelPaths(config_path=config_path, weights_path=weights_path)
+            )
+    return model_paths
+
+
+def list_cc_model_paths(runs_dir: Path) -> list[ModelPaths]:
+    model_paths: list[ModelPaths] = []
+    if not runs_dir.exists():
+        return model_paths
+
+    for config_path in sorted(runs_dir.rglob("cc_representation_model_*.json")):
         weights_path = config_path.with_suffix(".safetensors")
         if weights_path.exists():
             model_paths.append(
@@ -346,6 +364,176 @@ def sigmoid_np(logits: np.ndarray) -> np.ndarray:
     logits = np.clip(logits, -80.0, 80.0)
     return 1.0 / (1.0 + np.exp(-logits))
 
+
+def grid_similarity(
+    grid: np.ndarray,
+    reference_grid: np.ndarray,
+) -> float:
+    grid = np.asarray(grid, dtype=np.int64)
+    reference_grid = np.asarray(reference_grid, dtype=np.int64)
+    if grid.shape != reference_grid.shape:
+        raise ValueError(
+            f"Expected grids with matching shapes, got {grid.shape} and {reference_grid.shape}."
+        )
+    return float(np.mean(grid == reference_grid))
+
+
+def max_similarity_to_references(
+    grid: np.ndarray | None,
+    reference_grids: list[np.ndarray],
+) -> float | None:
+    if grid is None or not reference_grids:
+        return None
+    return max(grid_similarity(grid, reference_grid) for reference_grid in reference_grids)
+
+
+def find_connected_component_masks(mask: np.ndarray) -> list[np.ndarray]:
+    mask = np.asarray(mask, dtype=np.bool_)
+    height, width = mask.shape
+    visited = np.zeros((height, width), dtype=np.bool_)
+    component_masks: list[np.ndarray] = []
+
+    for start_y in range(height):
+        for start_x in range(width):
+            if not mask[start_y, start_x] or visited[start_y, start_x]:
+                continue
+
+            component_mask = np.zeros((height, width), dtype=np.bool_)
+            queue = deque([(start_y, start_x)])
+            visited[start_y, start_x] = True
+            component_mask[start_y, start_x] = True
+
+            while queue:
+                y, x = queue.popleft()
+                for ny, nx in (
+                    (y - 1, x),
+                    (y - 1, x - 1),
+                    (y - 1, x + 1),
+                    (y + 1, x),
+                    (y + 1, x - 1),
+                    (y + 1, x + 1),
+                    (y, x - 1),
+                    (y, x + 1),
+                ):
+                    if (
+                        0 <= ny < height
+                        and 0 <= nx < width
+                        and mask[ny, nx]
+                        and not visited[ny, nx]
+                    ):
+                        visited[ny, nx] = True
+                        component_mask[ny, nx] = True
+                        queue.append((ny, nx))
+
+            component_masks.append(component_mask)
+
+    return component_masks
+
+
+def previous_score_delta(
+    current_score: float | None,
+    previous_score: float | None,
+) -> float | None:
+    if current_score is None or previous_score is None:
+        return None
+    return current_score - previous_score
+
+
+def similarity_payload_from_scores(
+    current_score: float | None,
+    previous_score: float | None,
+    reference_count: int,
+) -> dict[str, Any]:
+    return {
+        "score": current_score,
+        "delta": previous_score_delta(current_score, previous_score),
+        "reference_count": reference_count,
+    }
+
+
+def recording_similarity_payload(
+    frames: list[RecordingFrame],
+    frame_index: int,
+    layered_visualizer: LayeredVisualizer,
+    cc_scorer: ConnectedComponentSimilarityScorer | None,
+) -> dict[str, Any]:
+    reference_grids: list[np.ndarray] = []
+    level_history: deque[np.ndarray] = deque(maxlen=WINNING_REFERENCE_HISTORY_LENGTH)
+    current_level = frames[0].levels_completed if frames else 0
+
+    for frame in frames[:frame_index]:
+        grid = np.asarray(frame.grid, dtype=np.int64)
+        if frame.levels_completed > current_level:
+            reference_grids.extend(grid.copy() for grid in level_history)
+            level_history.clear()
+            current_level = frame.levels_completed
+
+        level_history.append(grid.copy())
+
+    current_grid = np.asarray(frames[frame_index].grid, dtype=np.int64)
+    previous_grid = (
+        np.asarray(frames[frame_index - 1].grid, dtype=np.int64)
+        if frame_index > 0
+        else None
+    )
+    current_score = (
+        cc_scorer.score_frame_against_references(
+            layered_visualizer,
+            current_grid,
+            reference_grids,
+        )
+        if cc_scorer is not None
+        else None
+    )
+    previous_score = (
+        cc_scorer.score_frame_against_references(
+            layered_visualizer,
+            previous_grid,
+            reference_grids,
+        )
+        if cc_scorer is not None and previous_grid is not None
+        else None
+    )
+
+    return similarity_payload_from_scores(
+        current_score=current_score,
+        previous_score=previous_score,
+        reference_count=len(reference_grids),
+    )
+
+
+def live_similarity_payload(
+    current_grid: np.ndarray | None,
+    previous_grid: np.ndarray | None,
+    reference_grids: list[np.ndarray],
+    layered_visualizer: LayeredVisualizer,
+    cc_scorer: ConnectedComponentSimilarityScorer | None,
+) -> dict[str, Any]:
+    current_score = (
+        cc_scorer.score_frame_against_references(
+            layered_visualizer,
+            current_grid,
+            reference_grids,
+        )
+        if cc_scorer is not None
+        else None
+    )
+    previous_score = (
+        cc_scorer.score_frame_against_references(
+            layered_visualizer,
+            previous_grid,
+            reference_grids,
+        )
+        if cc_scorer is not None and previous_grid is not None
+        else None
+    )
+    return similarity_payload_from_scores(
+        current_score=current_score,
+        previous_score=previous_score,
+        reference_count=len(reference_grids),
+    )
+
+
 def isolate_cc(gate: np.ndarray) -> np.ndarray:
     """
     Args:
@@ -497,6 +685,180 @@ class LayeredVisualizer:
             },
         }
 
+    def dynamic_component_masks(
+        self,
+        grid: list[list[int]] | np.ndarray,
+        threshold: float = 0.5,
+    ) -> list[np.ndarray]:
+        frame = np.asarray(grid, dtype=np.int64)
+        if frame.shape != (64, 64):
+            raise ValueError(f"Expected a 64x64 grid, got {frame.shape}.")
+
+        *_, dynamic_gate_logits = self._get_net().decompose(mx.array(frame[None, :, :]))
+        dynamic_gate = sigmoid_np(np.asarray(dynamic_gate_logits)[0, ..., 0])
+        return find_connected_component_masks(dynamic_gate <= threshold)
+
+
+class ConnectedComponentSimilarityScorer:
+    def __init__(self, config_path: Path, weights_path: Path) -> None:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        self.config_path = config_path
+        self.weights_path = weights_path
+        self.num_colours = int(config.get("num_colours", 16))
+        self.color_embedding_dim = int(config.get("color_embeddings_dim", 16))
+        self.hidden_dim = int(config.get("hidden_dim", 64))
+        self.component_embedding_dim = int(config.get("component_embedding_dim", 48))
+        self.position_feature_dim = int(config.get("position_feature_dim", 0))
+        self.net: ConnectedComponentConvNet | None = None
+        self._load_lock = Lock()
+
+    def _get_net(self) -> ConnectedComponentConvNet:
+        if self.net is None:
+            with self._load_lock:
+                if self.net is None:
+                    net = ConnectedComponentConvNet(
+                        num_colors=self.num_colours,
+                        color_embedding_dim=self.color_embedding_dim,
+                        hidden_dim=self.hidden_dim,
+                        component_embedding_dim=self.component_embedding_dim,
+                        position_feature_dim=self.position_feature_dim,
+                    )
+                    net.load_weights(str(self.weights_path))
+                    net.eval()
+                    self.net = net
+        return self.net
+
+    def score_frame_against_references(
+        self,
+        layered_visualizer: LayeredVisualizer,
+        grid: np.ndarray | None,
+        reference_grids: list[np.ndarray],
+    ) -> float | None:
+        if grid is None or not reference_grids:
+            return None
+
+        candidate_embeddings = self._frame_component_embeddings(layered_visualizer, grid)
+        if candidate_embeddings.shape[0] == 0:
+            return None
+
+        scores = []
+        for reference_grid in reference_grids:
+            reference_embeddings = self._frame_component_embeddings(
+                layered_visualizer,
+                reference_grid,
+            )
+            if reference_embeddings.shape[0] == 0:
+                continue
+            pairwise_scores = candidate_embeddings @ reference_embeddings.T
+            scores.append(self._max_matching_score(pairwise_scores))
+
+        return max(scores) if scores else None
+
+    def _frame_component_embeddings(
+        self,
+        layered_visualizer: LayeredVisualizer,
+        grid: np.ndarray,
+    ) -> np.ndarray:
+        frame = np.asarray(grid, dtype=np.int64)
+        if frame.shape != (64, 64):
+            raise ValueError(f"Expected a 64x64 grid, got {frame.shape}.")
+
+        component_masks = layered_visualizer.dynamic_component_masks(frame)
+        if not component_masks:
+            return np.zeros((0, self.component_embedding_dim), dtype=np.float32)
+
+        frames = np.repeat(frame[None, :, :], len(component_masks), axis=0)
+        masks = np.stack(component_masks)
+        dynamic_masks = np.repeat(np.any(masks, axis=0)[None, :, :], len(component_masks), axis=0)
+        component_features = self._get_net()(mx.array(frames), mx.array(dynamic_masks))
+        embeddings = self._get_net().cc_embedding_from_features(
+            component_features,
+            mx.array(masks),
+        )
+        embeddings = self._normalize_mx(embeddings)
+        return np.asarray(embeddings, dtype=np.float32)
+
+    def _normalize_mx(self, embeddings: mx.array) -> mx.array:
+        norm = mx.sqrt(mx.sum(embeddings * embeddings, axis=-1, keepdims=True))
+        return embeddings / mx.maximum(norm, 1e-6)
+
+    def _max_matching_score(self, pairwise_scores: np.ndarray) -> float:
+        num_candidate_components, num_reference_components = pairwise_scores.shape
+        if num_candidate_components == 0 or num_reference_components == 0:
+            return 0.0
+
+        scores = pairwise_scores.astype(np.float64)
+        if scores.shape[0] > scores.shape[1]:
+            scores = scores.T
+
+        assignment = self._max_weight_assignment(scores)
+        total_score = sum(
+            float(scores[row_idx, col_idx])
+            for row_idx, col_idx in enumerate(assignment)
+        )
+        return total_score / max(num_candidate_components, num_reference_components)
+
+    def _max_weight_assignment(self, scores: np.ndarray) -> np.ndarray:
+        num_rows, num_cols = scores.shape
+        costs = -scores
+        potentials_rows = np.zeros(num_rows + 1, dtype=np.float64)
+        potentials_cols = np.zeros(num_cols + 1, dtype=np.float64)
+        matched_row_by_col = np.zeros(num_cols + 1, dtype=np.int64)
+        previous_col = np.zeros(num_cols + 1, dtype=np.int64)
+
+        for row in range(1, num_rows + 1):
+            matched_row_by_col[0] = row
+            current_col = 0
+            min_cost_by_col = np.full(num_cols + 1, np.inf, dtype=np.float64)
+            used_cols = np.zeros(num_cols + 1, dtype=np.bool_)
+
+            while True:
+                used_cols[current_col] = True
+                current_row = matched_row_by_col[current_col]
+                delta = np.inf
+                next_col = 0
+
+                for col in range(1, num_cols + 1):
+                    if used_cols[col]:
+                        continue
+                    current_cost = (
+                        costs[current_row - 1, col - 1]
+                        - potentials_rows[current_row]
+                        - potentials_cols[col]
+                    )
+                    if current_cost < min_cost_by_col[col]:
+                        min_cost_by_col[col] = current_cost
+                        previous_col[col] = current_col
+                    if min_cost_by_col[col] < delta:
+                        delta = min_cost_by_col[col]
+                        next_col = col
+
+                for col in range(num_cols + 1):
+                    if used_cols[col]:
+                        potentials_rows[matched_row_by_col[col]] += delta
+                        potentials_cols[col] -= delta
+                    else:
+                        min_cost_by_col[col] -= delta
+
+                current_col = next_col
+                if matched_row_by_col[current_col] == 0:
+                    break
+
+            while True:
+                next_col = previous_col[current_col]
+                matched_row_by_col[current_col] = matched_row_by_col[next_col]
+                current_col = next_col
+                if current_col == 0:
+                    break
+
+        assignment = np.full(num_rows, -1, dtype=np.int64)
+        for col in range(1, num_cols + 1):
+            row = matched_row_by_col[col]
+            if row != 0:
+                assignment[row - 1] = col - 1
+
+        return assignment
+
 
 class GameController:
     def __init__(
@@ -515,6 +877,11 @@ class GameController:
         self.current_frame: FrameDataRaw | None = None
         self.current_game_id = ""
         self.step_count = 0
+        self.winning_reference_grids: list[np.ndarray] = []
+        self.level_frame_history: deque[np.ndarray] = deque(
+            maxlen=WINNING_REFERENCE_HISTORY_LENGTH
+        )
+        self.previous_grid: np.ndarray | None = None
 
     def games(self) -> list[dict[str, Any]]:
         games = []
@@ -545,6 +912,7 @@ class GameController:
             self.current_frame = env.observation_space
             self.current_game_id = game_id
             self.step_count = 0
+            self._reset_similarity_tracking(frame_to_grid(self.current_frame))
             return snapshot_from_frame(self.current_frame, self.step_count, game_id)
 
     def reset(self) -> GameSnapshot:
@@ -554,6 +922,7 @@ class GameController:
 
             self.current_frame = self.env.reset()
             self.step_count = 0
+            self._reset_similarity_tracking(frame_to_grid(self.current_frame))
             return snapshot_from_frame(
                 self.current_frame,
                 self.step_count,
@@ -571,6 +940,20 @@ class GameController:
     def current_grid(self) -> np.ndarray | None:
         with self.lock:
             return frame_to_grid(self.current_frame)
+
+    def similarity_payload(
+        self,
+        layered_visualizer: LayeredVisualizer,
+        cc_scorer: ConnectedComponentSimilarityScorer | None,
+    ) -> dict[str, Any]:
+        with self.lock:
+            return live_similarity_payload(
+                current_grid=frame_to_grid(self.current_frame),
+                previous_grid=self.previous_grid,
+                reference_grids=self.winning_reference_grids,
+                layered_visualizer=layered_visualizer,
+                cc_scorer=cc_scorer,
+            )
 
     def step(
         self,
@@ -604,6 +987,7 @@ class GameController:
                 action.set_data(action_data)
 
             before_frame = self.current_frame
+            before_grid = frame_to_grid(before_frame)
             before_snapshot = snapshot_from_frame(
                 before_frame,
                 self.step_count,
@@ -620,6 +1004,15 @@ class GameController:
 
             self.current_frame = next_frame
             self.step_count += 1
+            current_grid = frame_to_grid(self.current_frame)
+            if self.current_frame.levels_completed > before_snapshot.levels_completed:
+                self.winning_reference_grids.extend(
+                    grid.copy() for grid in self.level_frame_history
+                )
+                self.level_frame_history.clear()
+            if current_grid is not None:
+                self.level_frame_history.append(current_grid.copy())
+            self.previous_grid = before_grid.copy() if before_grid is not None else None
             return {
                 "before": before_snapshot.__dict__,
                 "current": snapshot_from_frame(
@@ -627,14 +1020,21 @@ class GameController:
                     self.step_count,
                     self.current_game_id,
                 ).__dict__,
-                "before_grid": frame_to_grid(before_frame),
-                "current_grid": frame_to_grid(self.current_frame),
+                "before_grid": before_grid,
+                "current_grid": current_grid,
                 "action": {
                     "id": action_id,
                     "label": action_label(action_id, action_data),
                     "data": action_data,
                 },
             }
+
+    def _reset_similarity_tracking(self, grid: np.ndarray | None) -> None:
+        self.winning_reference_grids.clear()
+        self.level_frame_history.clear()
+        self.previous_grid = None
+        if grid is not None:
+            self.level_frame_history.append(grid.copy())
 
 
 class InvalidActionError(ValueError):
@@ -782,11 +1182,46 @@ HTML_TEMPLATE = """
         text-transform: uppercase;
       }
 
-      .score-value {
-        min-height: 18px;
-        overflow-wrap: anywhere;
-        font-size: 13px;
-      }
+	      .score-value {
+	        min-height: 18px;
+	        overflow-wrap: anywhere;
+	        font-size: 13px;
+	      }
+
+	      .similarity-panel {
+	        margin: 0 0 18px;
+	        padding: 12px 0 14px;
+	        border-bottom: 1px solid #d9d9d4;
+	      }
+
+	      .similarity-header {
+	        display: grid;
+	        grid-template-columns: repeat(3, minmax(0, 1fr));
+	        gap: 12px;
+	        margin-bottom: 10px;
+	      }
+
+	      .similarity-value {
+	        min-height: 20px;
+	        font-size: 16px;
+	        font-variant-numeric: tabular-nums;
+	      }
+
+	      .similarity-value.is-up {
+	        color: #167a4a;
+	      }
+
+	      .similarity-value.is-down {
+	        color: #aa2f2f;
+	      }
+
+	      .similarity-plot {
+	        display: block;
+	        width: 100%;
+	        height: 130px;
+	        border: 1px solid #d5d5d0;
+	        background: #fff;
+	      }
 
       .preview-grid {
         display: grid;
@@ -901,10 +1336,11 @@ HTML_TEMPLATE = """
           width: 100%;
         }
 
-        .score-strip,
-        .preview-grid,
-        .metrics {
-          grid-template-columns: 1fr;
+	        .score-strip,
+	        .similarity-header,
+	        .preview-grid,
+	        .metrics {
+	          grid-template-columns: 1fr;
         }
       }
     </style>
@@ -914,11 +1350,17 @@ HTML_TEMPLATE = """
       <section class="controls">
         <h1>Layered Model</h1>
 
-        <div class="control-group">
-          <label for="model-select">Model</label>
-          <select id="model-select" class="select"></select>
-          <div id="model-status" class="status-text"></div>
-        </div>
+	        <div class="control-group">
+	          <label for="model-select">Model</label>
+	          <select id="model-select" class="select"></select>
+	          <div id="model-status" class="status-text"></div>
+	        </div>
+
+	        <div class="control-group">
+	          <label for="cc-model-select">CC Embedding Model</label>
+	          <select id="cc-model-select" class="select"></select>
+	          <div id="cc-model-status" class="status-text"></div>
+	        </div>
 
         <div class="control-group source-toggle">
           <label><input type="radio" name="source-mode" value="recording" checked> Recording</label>
@@ -994,9 +1436,28 @@ HTML_TEMPLATE = """
             <div class="score-label">Action</div>
             <div id="action-value" class="score-value">-</div>
           </div>
-        </div>
-
-        <div class="preview-grid">
+	        </div>
+	
+	        <div class="similarity-panel">
+	          <h2>Learned CC Similarity To Previous Winning Frames</h2>
+	          <div class="similarity-header">
+	            <div>
+	              <div class="score-label">Current</div>
+	              <div id="similarity-value" class="similarity-value">-</div>
+	            </div>
+	            <div>
+	              <div class="score-label">Change</div>
+	              <div id="similarity-delta-value" class="similarity-value">-</div>
+	            </div>
+	            <div>
+	              <div class="score-label">References</div>
+	              <div id="similarity-reference-value" class="similarity-value">-</div>
+	            </div>
+	          </div>
+	          <canvas id="similarity-plot" class="similarity-plot"></canvas>
+	        </div>
+	
+	        <div class="preview-grid">
           <div class="preview-panel">
             <h2>Input Frame</h2>
             <img id="input-image" alt="Input frame">
@@ -1076,14 +1537,18 @@ HTML_TEMPLATE = """
     <div id="gate-tooltip" class="gate-tooltip" hidden></div>
 
     <script>
-      const games = {{ games|tojson }};
-      const models = {{ models|tojson }};
-      const recordings = {{ recordings|tojson }};
-      const initialGameId = {{ selected_game_id|tojson }};
-      const initialModelKey = {{ selected_model_key|tojson }};
-
-      const modelSelect = document.getElementById("model-select");
-      const modelStatus = document.getElementById("model-status");
+	      const games = {{ games|tojson }};
+	      const models = {{ models|tojson }};
+	      const ccModels = {{ cc_models|tojson }};
+	      const recordings = {{ recordings|tojson }};
+	      const initialGameId = {{ selected_game_id|tojson }};
+	      const initialModelKey = {{ selected_model_key|tojson }};
+	      const initialCcModelKey = {{ selected_cc_model_key|tojson }};
+	
+	      const modelSelect = document.getElementById("model-select");
+	      const ccModelSelect = document.getElementById("cc-model-select");
+	      const ccModelStatus = document.getElementById("cc-model-status");
+	      const modelStatus = document.getElementById("model-status");
       const recordingSelect = document.getElementById("recording-select");
       const recordingStatus = document.getElementById("recording-status");
       const frameScrubber = document.getElementById("frame-scrubber");
@@ -1100,10 +1565,14 @@ HTML_TEMPLATE = """
       const actionButtons = document.getElementById("action-buttons");
       const sourceValue = document.getElementById("source-value");
       const stateValue = document.getElementById("state-value");
-      const levelValue = document.getElementById("level-value");
-      const stepValue = document.getElementById("step-value");
-      const actionValue = document.getElementById("action-value");
-      const inputImage = document.getElementById("input-image");
+	      const levelValue = document.getElementById("level-value");
+	      const stepValue = document.getElementById("step-value");
+	      const actionValue = document.getElementById("action-value");
+	      const similarityValue = document.getElementById("similarity-value");
+	      const similarityDeltaValue = document.getElementById("similarity-delta-value");
+	      const similarityReferenceValue = document.getElementById("similarity-reference-value");
+	      const similarityPlot = document.getElementById("similarity-plot");
+	      const inputImage = document.getElementById("input-image");
       const staticImage = document.getElementById("static-image");
       const dynamicImage = document.getElementById("dynamic-image");
       const dynamicMaskedImage = document.getElementById("dynamic-masked-image");
@@ -1138,10 +1607,13 @@ HTML_TEMPLATE = """
       let currentFrames = [];
       let currentSnapshot = null;
       let recordingRequestId = 0;
-      let renderRequestId = 0;
-      let playTimer = null;
-      let toastTimer = null;
-      let currentGateValues = {};
+	      let renderRequestId = 0;
+	      let playTimer = null;
+	      let toastTimer = null;
+	      let currentGateValues = {};
+	      const similarityHistoryLimit = 80;
+	      let similarityHistory = [];
+	      let similarityHistoryKey = "";
 
       function getDecodeMode() {
         const selected = modeInputs.find((input) => input.checked);
@@ -1153,9 +1625,13 @@ HTML_TEMPLATE = """
         return selected ? selected.value : "recording";
       }
 
-      function selectedModel() {
-        return models.find((model) => model.key === modelSelect.value);
-      }
+	      function selectedModel() {
+	        return models.find((model) => model.key === modelSelect.value);
+	      }
+
+	      function selectedCcModel() {
+	        return ccModels.find((model) => model.key === ccModelSelect.value);
+	      }
 
       function showToast(message) {
         toast.textContent = message;
@@ -1178,11 +1654,198 @@ HTML_TEMPLATE = """
         return Number.isFinite(value) ? value.toFixed(4) : "-";
       }
 
-      function formatPercent(value) {
-        return Number.isFinite(value) ? `${(value * 100).toFixed(1)}%` : "-";
-      }
+	      function formatPercent(value) {
+	        return Number.isFinite(value) ? `${(value * 100).toFixed(1)}%` : "-";
+	      }
 
-      function renderMetrics(metrics) {
+	      function formatSimilarity(value) {
+	        return Number.isFinite(value) ? value.toFixed(4) : "-";
+	      }
+
+	      function setTrendClass(element, value) {
+	        element.classList.toggle("is-up", Number.isFinite(value) && value > 0);
+	        element.classList.toggle("is-down", Number.isFinite(value) && value < 0);
+	      }
+
+		      function currentSimilarityHistoryKey() {
+		        const sourceMode = getSourceMode();
+		        const sourceKey = sourceMode === "recording"
+		          ? recordingSelect.value
+		          : `${gameSelect.value}:${seedInput.value || 0}`;
+		        return [
+		          sourceMode,
+		          sourceKey,
+		          modelSelect.value,
+		          ccModelSelect.value,
+		          getDecodeMode(),
+		        ].join("|");
+		      }
+
+		      function resetSimilarityHistory() {
+		        similarityHistory = [];
+		        similarityHistoryKey = currentSimilarityHistoryKey();
+		      }
+
+		      function previousSimilarityPoint(step) {
+		        return similarityHistory
+		          .filter((point) => point.step < step)
+		          .sort((a, b) => b.step - a.step)[0] || null;
+		      }
+
+		      function rememberSimilarityPoint(step, score, referenceCount) {
+		        const key = currentSimilarityHistoryKey();
+		        if (key !== similarityHistoryKey) {
+		          similarityHistory = [];
+		          similarityHistoryKey = key;
+		        }
+		        if (!Number.isFinite(step) || !Number.isFinite(score)) {
+		          return null;
+		        }
+
+		        const previousPoint = previousSimilarityPoint(step);
+		        const existingIndex = similarityHistory.findIndex((point) => point.step === step);
+		        const point = {step, score, referenceCount};
+		        if (existingIndex >= 0) {
+		          similarityHistory[existingIndex] = point;
+		        } else {
+		          similarityHistory.push(point);
+		        }
+		        while (similarityHistory.length > similarityHistoryLimit) {
+		          similarityHistory.shift();
+		        }
+		        return previousPoint;
+		      }
+
+		      function renderSimilarity(similarity, step) {
+		        if (!similarity) {
+		          resetSimilarityHistory();
+		          similarityValue.textContent = "-";
+		          similarityDeltaValue.textContent = "-";
+		          similarityReferenceValue.textContent = "0";
+		          setTrendClass(similarityValue, NaN);
+		          setTrendClass(similarityDeltaValue, NaN);
+		          drawSimilarityPlot(0, NaN, 0);
+		          return;
+		        }
+		        const score = Number(similarity.score);
+		        const delta = Number(similarity.delta);
+		        const referenceCount = Number(similarity.reference_count || 0);
+		        const pointStep = Number.isFinite(Number(step)) ? Number(step) : similarityHistory.length;
+		        const previousPoint = rememberSimilarityPoint(pointStep, score, referenceCount);
+		        const displayDelta = Number.isFinite(delta)
+		          ? delta
+		          : (previousPoint ? score - previousPoint.score : NaN);
+
+		        similarityValue.textContent = formatSimilarity(score);
+		        similarityDeltaValue.textContent = Number.isFinite(displayDelta)
+		          ? `${displayDelta >= 0 ? "+" : ""}${formatSimilarity(displayDelta)}`
+		          : "-";
+		        similarityReferenceValue.textContent = referenceCount ? String(referenceCount) : "0";
+		        setTrendClass(similarityValue, displayDelta);
+		        setTrendClass(similarityDeltaValue, displayDelta);
+		        drawSimilarityPlot(pointStep, displayDelta, referenceCount);
+		      }
+
+		      function drawSimilarityPlot(currentStep, delta, referenceCount) {
+		        const rect = similarityPlot.getBoundingClientRect();
+		        const dpr = window.devicePixelRatio || 1;
+		        const width = Math.max(240, Math.floor(rect.width || 640));
+	        const height = Math.max(110, Math.floor(rect.height || 130));
+	        similarityPlot.width = Math.floor(width * dpr);
+	        similarityPlot.height = Math.floor(height * dpr);
+	        const ctx = similarityPlot.getContext("2d");
+	        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+	        ctx.clearRect(0, 0, width, height);
+	        ctx.fillStyle = "#ffffff";
+	        ctx.fillRect(0, 0, width, height);
+
+	        const padding = {left: 34, right: 12, top: 12, bottom: 24};
+	        const plotWidth = width - padding.left - padding.right;
+	        const plotHeight = height - padding.top - padding.bottom;
+	        ctx.strokeStyle = "#e1e1dc";
+	        ctx.lineWidth = 1;
+	        for (const yValue of [-1, 0, 1]) {
+	          const y = padding.top + ((1 - yValue) / 2) * plotHeight;
+	          ctx.beginPath();
+	          ctx.moveTo(padding.left, y);
+	          ctx.lineTo(width - padding.right, y);
+	          ctx.stroke();
+	        }
+
+	        ctx.fillStyle = "#777";
+	        ctx.font = "11px system-ui, sans-serif";
+	        ctx.fillText("1.0", 5, padding.top + 4);
+	        ctx.fillText("0.0", 5, padding.top + plotHeight * 0.5 + 4);
+	        ctx.fillText("-1.0", 5, padding.top + plotHeight + 4);
+
+		        const points = similarityHistory
+		          .filter((point) => Number.isFinite(point.score))
+		          .sort((a, b) => a.step - b.step);
+		        if (!points.length) {
+		          ctx.fillStyle = "#777";
+		          ctx.fillText("No previous winning-frame references yet.", padding.left, padding.top + 22);
+		          return;
+		        }
+
+		        const toY = (score) => padding.top + ((1 - Math.max(-1, Math.min(1, score))) / 2) * plotHeight;
+		        const minStep = points[0].step;
+		        const maxStep = points[points.length - 1].step;
+		        const stepSpan = Math.max(1, maxStep - minStep);
+		        const toX = (step) => padding.left + ((step - minStep) / stepSpan) * plotWidth;
+
+		        ctx.strokeStyle = "#56616f";
+		        ctx.lineWidth = 2;
+		        ctx.beginPath();
+		        points.forEach((point, index) => {
+		          const x = toX(point.step);
+		          const y = toY(point.score);
+		          if (index === 0) {
+		            ctx.moveTo(x, y);
+		          } else {
+		            ctx.lineTo(x, y);
+		          }
+		        });
+		        ctx.stroke();
+
+		        if (points.length > 1) {
+		          const currentIndex = points.findIndex((point) => point.step === currentStep);
+		          const index = currentIndex >= 0 ? currentIndex : points.length - 1;
+		          const currentPoint = points[index];
+		          const previousPoint = points[index - 1] || null;
+		          const segmentDelta = previousPoint ? currentPoint.score - previousPoint.score : delta;
+		          if (previousPoint) {
+		            ctx.strokeStyle = segmentDelta >= 0 ? "#1f9d62" : "#c64646";
+		            ctx.lineWidth = 3;
+		            ctx.beginPath();
+		            ctx.moveTo(toX(previousPoint.step), toY(previousPoint.score));
+		            ctx.lineTo(toX(currentPoint.step), toY(currentPoint.score));
+		            ctx.stroke();
+		          }
+		        }
+
+		        for (const point of points) {
+		          ctx.fillStyle = point.step === currentStep ? "#111" : "#9aa0a6";
+		          ctx.beginPath();
+		          ctx.arc(toX(point.step), toY(point.score), point.step === currentStep ? 4 : 2.5, 0, Math.PI * 2);
+		          ctx.fill();
+		        }
+
+		        const currentPoint = points.find((point) => point.step === currentStep) || points[points.length - 1];
+		        if (currentPoint) {
+		          ctx.fillStyle = Number.isFinite(delta) && delta < 0 ? "#c64646" : "#1f9d62";
+		          ctx.beginPath();
+		          ctx.arc(toX(currentPoint.step), toY(currentPoint.score), 5, 0, Math.PI * 2);
+		          ctx.fill();
+		        }
+
+		        ctx.fillStyle = "#555";
+		        ctx.fillText(`${referenceCount} refs`, padding.left, height - 7);
+		        if (points.length > 1) {
+		          ctx.fillText(`${minStep}..${maxStep}`, width - padding.right - 58, height - 7);
+		        }
+		      }
+	
+	      function renderMetrics(metrics) {
         metrics = metrics || {};
         staticConfidenceValue.textContent = formatNumber(metrics.static_confidence_mean);
         dynamicGateValue.textContent = formatNumber(metrics.dynamic_gate_mean);
@@ -1291,16 +1954,25 @@ HTML_TEMPLATE = """
         actionValue.textContent = payload.action?.label || "-";
       }
 
-      function updateModelStatus() {
-        const model = selectedModel();
-        if (!model) {
-          modelStatus.textContent = models.length ? "No model selected." : "No layered models found.";
-          return;
-        }
-        modelStatus.textContent = model.label;
-      }
+	      function updateModelStatus() {
+	        const model = selectedModel();
+	        if (!model) {
+	          modelStatus.textContent = models.length ? "No model selected." : "No layered models found.";
+	          return;
+	        }
+	        modelStatus.textContent = model.label;
+	      }
 
-      function buildModelOptions() {
+	      function updateCcModelStatus() {
+	        const model = selectedCcModel();
+	        if (!model) {
+	          ccModelStatus.textContent = ccModels.length ? "No CC model selected." : "No CC embedding models found.";
+	          return;
+	        }
+	        ccModelStatus.textContent = model.label;
+	      }
+
+	      function buildModelOptions() {
         if (!models.length) {
           const option = document.createElement("option");
           option.value = "";
@@ -1317,8 +1989,28 @@ HTML_TEMPLATE = """
           modelSelect.appendChild(option);
         }
         modelSelect.value = initialModelKey || models[0].key;
-        updateModelStatus();
-      }
+	        updateModelStatus();
+	      }
+
+	      function buildCcModelOptions() {
+	        if (!ccModels.length) {
+	          const option = document.createElement("option");
+	          option.value = "";
+	          option.textContent = "No CC models found";
+	          ccModelSelect.appendChild(option);
+	          updateCcModelStatus();
+	          return;
+	        }
+
+	        for (const model of ccModels) {
+	          const option = document.createElement("option");
+	          option.value = model.key;
+	          option.textContent = model.label;
+	          ccModelSelect.appendChild(option);
+	        }
+	        ccModelSelect.value = initialCcModelKey || ccModels[0].key;
+	        updateCcModelStatus();
+	      }
 
       function buildRecordingOptions() {
         const emptyOption = document.createElement("option");
@@ -1373,17 +2065,19 @@ HTML_TEMPLATE = """
         );
       }
 
-      function setSourceMode() {
-        const mode = getSourceMode();
-        recordingControls.hidden = mode !== "recording";
-        liveControls.hidden = mode !== "live";
-        if (mode === "recording") {
-          renderSelectedRecordingFrame();
-        } else {
-          stopPlayback();
-        }
-        updateActionButtons();
-      }
+	      function setSourceMode() {
+	        const mode = getSourceMode();
+	        recordingControls.hidden = mode !== "recording";
+	        liveControls.hidden = mode !== "live";
+	        resetSimilarityHistory();
+	        if (mode === "recording") {
+	          renderSelectedRecordingFrame();
+	        } else {
+	          stopPlayback();
+	          renderSimilarity(null);
+	        }
+	        updateActionButtons();
+	      }
 
       async function getJson(url) {
         const response = await fetch(url);
@@ -1419,11 +2113,12 @@ HTML_TEMPLATE = """
         recordingStatus.textContent = "";
         stopPlayback();
 
-        if (!recordingSelect.value) {
-          renderLayerImages(null);
-          setImage(actualNextImage, null);
-          return;
-        }
+	        if (!recordingSelect.value) {
+	          renderLayerImages(null);
+		          renderSimilarity(null);
+		          setImage(actualNextImage, null);
+		          return;
+		        }
 
         recordingStatus.textContent = "Loading...";
         try {
@@ -1431,8 +2126,9 @@ HTML_TEMPLATE = """
           if (requestId !== recordingRequestId) {
             return;
           }
-          currentFrames = payload.frames;
-          frameScrubber.max = String(Math.max(0, currentFrames.length - 1));
+	          currentFrames = payload.frames;
+	          resetSimilarityHistory();
+	          frameScrubber.max = String(Math.max(0, currentFrames.length - 1));
           updateScrubberMeta();
           recordingStatus.textContent = `Loaded ${currentFrames.length} frame${currentFrames.length === 1 ? "" : "s"}.`;
           renderSelectedRecordingFrame();
@@ -1463,8 +2159,9 @@ HTML_TEMPLATE = """
         renderRequestId = requestId;
         updateScrubberMeta();
         const params = new URLSearchParams();
-        params.set("model", modelSelect.value);
-        params.set("recording", recordingSelect.value);
+	        params.set("model", modelSelect.value);
+	        params.set("cc_model", ccModelSelect.value);
+	        params.set("recording", recordingSelect.value);
         params.set("frame_index", frameScrubber.value);
         params.set("mode", getDecodeMode());
 
@@ -1473,9 +2170,10 @@ HTML_TEMPLATE = """
           if (requestId !== renderRequestId) {
             return;
           }
-          renderMeta(payload);
-          renderLayerImages(payload.layers);
-          setImage(actualNextImage, payload.actual_next_image);
+	          renderMeta(payload);
+	          renderLayerImages(payload.layers);
+		          renderSimilarity(payload.similarity, payload.step);
+	          setImage(actualNextImage, payload.actual_next_image);
         } catch (error) {
           showToast(error instanceof Error ? error.message : "Failed to render frame.");
         }
@@ -1512,16 +2210,19 @@ HTML_TEMPLATE = """
 
       async function startGame() {
         try {
-          const payload = await postJson("/api/live/start", {
-            game_id: gameSelect.value,
-            seed: Number(seedInput.value || 0),
-            model: modelSelect.value,
-            mode: getDecodeMode(),
-          });
-          currentSnapshot = payload.current;
-          renderMeta(payload);
-          renderLayerImages(payload.layers);
-          setImage(actualNextImage, null);
+	          const payload = await postJson("/api/live/start", {
+	            game_id: gameSelect.value,
+	            seed: Number(seedInput.value || 0),
+	            model: modelSelect.value,
+	            cc_model: ccModelSelect.value,
+	            mode: getDecodeMode(),
+	          });
+		          currentSnapshot = payload.current;
+		          resetSimilarityHistory();
+		          renderMeta(payload);
+		          renderLayerImages(payload.layers);
+		          renderSimilarity(payload.similarity, payload.step);
+	          setImage(actualNextImage, null);
           updateActionButtons();
         } catch (error) {
           showToast(error instanceof Error ? error.message : "Failed to start game.");
@@ -1530,14 +2231,17 @@ HTML_TEMPLATE = """
 
       async function resetGame() {
         try {
-          const payload = await postJson("/api/live/reset", {
-            model: modelSelect.value,
-            mode: getDecodeMode(),
-          });
-          currentSnapshot = payload.current;
-          renderMeta(payload);
-          renderLayerImages(payload.layers);
-          setImage(actualNextImage, null);
+	          const payload = await postJson("/api/live/reset", {
+	            model: modelSelect.value,
+	            cc_model: ccModelSelect.value,
+	            mode: getDecodeMode(),
+	          });
+		          currentSnapshot = payload.current;
+		          resetSimilarityHistory();
+		          renderMeta(payload);
+		          renderLayerImages(payload.layers);
+		          renderSimilarity(payload.similarity, payload.step);
+	          setImage(actualNextImage, null);
           updateActionButtons();
         } catch (error) {
           showToast(error instanceof Error ? error.message : "Failed to reset game.");
@@ -1550,14 +2254,16 @@ HTML_TEMPLATE = """
         }
 
         try {
-          const payload = await postJson("/api/live/current_render", {
-            model: modelSelect.value,
-            mode: getDecodeMode(),
-          });
-          currentSnapshot = payload.current;
-          renderMeta(payload);
-          renderLayerImages(payload.layers);
-          setImage(actualNextImage, null);
+	          const payload = await postJson("/api/live/current_render", {
+	            model: modelSelect.value,
+	            cc_model: ccModelSelect.value,
+	            mode: getDecodeMode(),
+	          });
+	          currentSnapshot = payload.current;
+	          renderMeta(payload);
+	          renderLayerImages(payload.layers);
+		          renderSimilarity(payload.similarity, payload.step);
+	          setImage(actualNextImage, null);
           updateActionButtons();
         } catch (error) {
           showToast(error instanceof Error ? error.message : "Failed to render current frame.");
@@ -1576,15 +2282,17 @@ HTML_TEMPLATE = """
 
         try {
           const payload = await postJson("/api/live/action", {
-            action_id: actionId,
-            data,
-            model: modelSelect.value,
-            mode: getDecodeMode(),
-          });
-          currentSnapshot = payload.current;
-          renderMeta(payload);
-          renderLayerImages(payload.current_layers);
-          setImage(nextImage, payload.predicted_next_image);
+	            action_id: actionId,
+	            data,
+	            model: modelSelect.value,
+	            cc_model: ccModelSelect.value,
+	            mode: getDecodeMode(),
+	          });
+	          currentSnapshot = payload.current;
+	          renderMeta(payload);
+	          renderLayerImages(payload.current_layers);
+		          renderSimilarity(payload.similarity, payload.step);
+	          setImage(nextImage, payload.predicted_next_image);
           setImage(nextDynamicImage, payload.predicted_next_dynamic_image);
           setImage(nextDynamicMaskedImage, payload.predicted_next_dynamic_masked_image);
           setImage(actualNextImage, payload.current.image);
@@ -1634,14 +2342,22 @@ HTML_TEMPLATE = """
         sendAction(action.id, {});
       }
 
-      modelSelect.addEventListener("change", () => {
-        updateModelStatus();
-        if (getSourceMode() === "recording") {
-          renderSelectedRecordingFrame();
-        } else if (currentSnapshot) {
-          renderLiveCurrent();
-        }
-      });
+	      modelSelect.addEventListener("change", () => {
+	        updateModelStatus();
+	        if (getSourceMode() === "recording") {
+	          renderSelectedRecordingFrame();
+	        } else if (currentSnapshot) {
+	          renderLiveCurrent();
+	        }
+	      });
+	      ccModelSelect.addEventListener("change", () => {
+	        updateCcModelStatus();
+	        if (getSourceMode() === "recording") {
+	          renderSelectedRecordingFrame();
+	        } else if (currentSnapshot) {
+	          renderLiveCurrent();
+	        }
+	      });
       for (const input of modeInputs) {
         input.addEventListener("change", () => {
           if (getSourceMode() === "recording") {
@@ -1660,10 +2376,12 @@ HTML_TEMPLATE = """
       playButton.addEventListener("click", togglePlayback);
       startButton.addEventListener("click", startGame);
       resetButton.addEventListener("click", resetGame);
-      gameSelect.addEventListener("change", () => {
-        currentSnapshot = null;
-        updateActionButtons();
-      });
+	      gameSelect.addEventListener("change", () => {
+	        currentSnapshot = null;
+	        resetSimilarityHistory();
+	        renderSimilarity(null);
+	        updateActionButtons();
+	      });
       inputImage.addEventListener("click", handleInputBoardClick);
       dynamicGateImage.addEventListener("mousemove", (event) => {
         showGateTooltip(event, dynamicGateImage, "dynamic_gate", "Dynamic gate");
@@ -1679,8 +2397,9 @@ HTML_TEMPLATE = """
       nextGateImage.addEventListener("mouseleave", hideGateTooltip);
       window.addEventListener("keydown", handleKeyboard);
 
-      buildModelOptions();
-      buildRecordingOptions();
+	      buildModelOptions();
+	      buildCcModelOptions();
+	      buildRecordingOptions();
       buildGameOptions();
       buildActionButtons();
       updateActionButtons();
@@ -1695,8 +2414,11 @@ HTML_TEMPLATE = """
 def create_app(
     controller: GameController,
     visualizers: dict[str, LayeredVisualizer],
+    cc_scorers: dict[str, ConnectedComponentSimilarityScorer],
     model_options: list[dict[str, Any]],
+    cc_model_options: list[dict[str, Any]],
     selected_model_key: str,
+    selected_cc_model_key: str,
     recordings_dir: Path,
 ) -> Flask:
     app = Flask(__name__)
@@ -1716,6 +2438,15 @@ def create_app(
         if visualizer is None:
             raise ValueError(f"Unknown model: {key}")
         return visualizer
+
+    def get_cc_scorer(model_key: str | None = None) -> ConnectedComponentSimilarityScorer | None:
+        key = model_key or selected_cc_model_key
+        if not key:
+            return None
+        scorer = cc_scorers.get(key)
+        if scorer is None:
+            raise ValueError(f"Unknown CC model: {key}")
+        return scorer
 
     def get_recording_frames(recording_key: str) -> list[RecordingFrame]:
         frames = recording_frames_by_key.get(recording_key)
@@ -1758,9 +2489,11 @@ def create_app(
             HTML_TEMPLATE,
             games=games,
             models=model_options,
+            cc_models=cc_model_options,
             recordings=recording_options,
             selected_game_id=selected_game_id,
             selected_model_key=selected_model_key,
+            selected_cc_model_key=selected_cc_model_key,
         )
 
     @app.get("/api/models")
@@ -1797,6 +2530,7 @@ def create_app(
     @app.get("/api/recording/render")
     def recording_render_json() -> Any:
         model_key = str(request.args.get("model") or selected_model_key)
+        cc_model_key = str(request.args.get("cc_model") or selected_cc_model_key)
         recording_key = str(request.args.get("recording") or "")
         mode = str(request.args.get("mode") or "argmax")
         frame_index = int(request.args.get("frame_index") or 0)
@@ -1811,7 +2545,9 @@ def create_app(
             action_id = int(action_input["id"]) if action_input else 0
             action_data = dict(action_input.get("data") or {}) if action_input else {}
             action = action_from_id(action_id, action_data)
-            layers = render_grid_layers(model_key, frame.grid, action=action, mode=mode)
+            visualizer = get_visualizer(model_key)
+            cc_scorer = get_cc_scorer(cc_model_key)
+            layers = visualizer.render_layers(frame.grid, action=action, mode=mode)
 
             return jsonify(
                 {
@@ -1826,6 +2562,12 @@ def create_app(
                         "data": action_data,
                     },
                     "layers": layers,
+                    "similarity": recording_similarity_payload(
+                        frames,
+                        frame_index,
+                        visualizer,
+                        cc_scorer,
+                    ),
                     "actual_next_image": (
                         grid_to_data_url(np.asarray(next_frame.grid, dtype=np.int64))
                         if next_frame is not None
@@ -1842,6 +2584,7 @@ def create_app(
         game_id = str(payload.get("game_id") or "")
         seed = int(payload.get("seed") or 0)
         model_key = str(payload.get("model") or selected_model_key)
+        cc_model_key = str(payload.get("cc_model") or selected_cc_model_key)
         mode = str(payload.get("mode") or "argmax")
         if not game_id:
             return jsonify({"error": "Missing game_id."}), 400
@@ -1851,6 +2594,7 @@ def create_app(
             grid = controller.current_grid()
             action = action_from_id(0, {})
             layers = render_grid_layers(model_key, grid, action=action, mode=mode) if grid is not None else None
+            visualizer = get_visualizer(model_key)
             return jsonify(
                 {
                     "source": "Live",
@@ -1861,6 +2605,10 @@ def create_app(
                     "action": {"id": 0, "label": "RESET", "data": {}},
                     "current": snapshot.__dict__,
                     "layers": layers,
+                    "similarity": controller.similarity_payload(
+                        visualizer,
+                        get_cc_scorer(cc_model_key),
+                    ),
                 }
             )
         except Exception as exc:
@@ -1870,6 +2618,7 @@ def create_app(
     def live_reset_json() -> Any:
         payload = request.get_json(force=True) or {}
         model_key = str(payload.get("model") or selected_model_key)
+        cc_model_key = str(payload.get("cc_model") or selected_cc_model_key)
         mode = str(payload.get("mode") or "argmax")
 
         try:
@@ -1877,6 +2626,7 @@ def create_app(
             grid = controller.current_grid()
             action = action_from_id(0, {})
             layers = render_grid_layers(model_key, grid, action=action, mode=mode) if grid is not None else None
+            visualizer = get_visualizer(model_key)
             return jsonify(
                 {
                     "source": "Live",
@@ -1887,6 +2637,10 @@ def create_app(
                     "action": {"id": 0, "label": "RESET", "data": {}},
                     "current": snapshot.__dict__,
                     "layers": layers,
+                    "similarity": controller.similarity_payload(
+                        visualizer,
+                        get_cc_scorer(cc_model_key),
+                    ),
                 }
             )
         except Exception as exc:
@@ -1896,6 +2650,7 @@ def create_app(
     def live_current_render_json() -> Any:
         payload = request.get_json(force=True) or {}
         model_key = str(payload.get("model") or selected_model_key)
+        cc_model_key = str(payload.get("cc_model") or selected_cc_model_key)
         mode = str(payload.get("mode") or "argmax")
 
         try:
@@ -1910,6 +2665,7 @@ def create_app(
                 if grid is not None
                 else None
             )
+            visualizer = get_visualizer(model_key)
             return jsonify(
                 {
                     "source": "Live",
@@ -1924,6 +2680,10 @@ def create_app(
                     },
                     "current": snapshot.__dict__,
                     "layers": layers,
+                    "similarity": controller.similarity_payload(
+                        visualizer,
+                        get_cc_scorer(cc_model_key),
+                    ),
                 }
             )
         except Exception as exc:
@@ -1933,6 +2693,7 @@ def create_app(
     def live_action_json() -> Any:
         payload = request.get_json(force=True) or {}
         model_key = str(payload.get("model") or selected_model_key)
+        cc_model_key = str(payload.get("cc_model") or selected_cc_model_key)
         mode = str(payload.get("mode") or "argmax")
         action_id = int(payload.get("action_id"))
         action_data = dict(payload.get("data") or {})
@@ -1953,6 +2714,7 @@ def create_app(
                 else None
             )
             current = step_payload["current"]
+            visualizer = get_visualizer(model_key)
 
             return jsonify(
                 {
@@ -1965,6 +2727,10 @@ def create_app(
                     "before": step_payload["before"],
                     "current": current,
                     "current_layers": current_layers,
+                    "similarity": controller.similarity_payload(
+                        visualizer,
+                        get_cc_scorer(cc_model_key),
+                    ),
                     "predicted_next_image": before_layers["next_reconstruction"] if before_layers else None,
                     "predicted_next_dynamic_image": before_layers["next_dynamic"] if before_layers else None,
                     "predicted_next_dynamic_masked_image": before_layers["next_dynamic_masked"] if before_layers else None,
@@ -2025,6 +2791,43 @@ def build_model_options(
     return visualizers, model_options, selected_model_key
 
 
+def build_cc_model_options(
+    runs_dir: Path,
+) -> tuple[
+    dict[str, ConnectedComponentSimilarityScorer],
+    list[dict[str, Any]],
+    str,
+]:
+    model_paths_list = list_cc_model_paths(runs_dir)
+    scorers: dict[str, ConnectedComponentSimilarityScorer] = {}
+    model_options: list[dict[str, Any]] = []
+    selected_model_key = ""
+
+    if model_paths_list:
+        selected_model = max(
+            model_paths_list,
+            key=lambda paths: paths.config_path.stat().st_mtime,
+        )
+        selected_model_key = str(selected_model.weights_path)
+
+    for model_paths in model_paths_list:
+        key = str(model_paths.weights_path)
+        scorer = ConnectedComponentSimilarityScorer(
+            config_path=model_paths.config_path,
+            weights_path=model_paths.weights_path,
+        )
+        scorers[key] = scorer
+        model_options.append(
+            {
+                "key": key,
+                "label": key,
+                "component_embedding_dim": scorer.component_embedding_dim,
+            }
+        )
+
+    return scorers, model_options, selected_model_key
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Visualize layered next-state model reconstructions and predictions."
@@ -2057,11 +2860,17 @@ def main() -> None:
         explicit_config=args.config,
         explicit_weights=args.weights,
     )
+    cc_scorers, cc_model_options, selected_cc_model_key = build_cc_model_options(
+        runs_dir=Path(args.runs_dir),
+    )
     app = create_app(
         controller=controller,
         visualizers=visualizers,
+        cc_scorers=cc_scorers,
         model_options=model_options,
+        cc_model_options=cc_model_options,
         selected_model_key=selected_model_key,
+        selected_cc_model_key=selected_cc_model_key,
         recordings_dir=Path(args.recordings_dir),
     )
     app.run(
