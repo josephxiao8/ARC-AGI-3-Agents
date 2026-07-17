@@ -1,5 +1,6 @@
+from .action_model import ActionModel, ConnectedComponentConvNet
 from .ConvVAE import ConvVAE
-from .mlp import MLP
 from .Layered import Layered
+from .mlp import MLP
 
-__all__ = ["ConvVAE", "MLP", "Layered"]
+__all__ = ["ConvVAE", "MLP", "Layered", "ActionModel", "ConnectedComponentConvNet"]
